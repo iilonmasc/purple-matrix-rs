@@ -1,3 +1,16 @@
+/*
+ * purple-matrix-rs: a libpurple protocol plugin for Matrix on the matrix-rust-sdk.
+ * Copyright (C) 2026 the purple-matrix-rs authors
+ *
+ * This program is free software; you can redistribute it and/or modify it under the terms of the
+ * GNU General Public License as published by the Free Software Foundation; either version 2 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+ * even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License in the file LICENSE for more details.
+ */
+
 /* purple-matrix-rs: the libpurple half.
  *
  * libpurple sees a protocol plugin written in C; everything Matrix lives in the Rust static library

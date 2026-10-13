@@ -51,4 +51,7 @@ start is a new login with a new device id, that is, a new token.
 
 ## Licence
 
-GPL-2.0-or-later, as libpurple itself; the SDK is Apache-2.0.
+GPL-2.0-or-later, as libpurple itself; every source file carries the header, the text is in
+[LICENSE](LICENSE). The SDK is Apache-2.0, which is incompatible with GPLv2 and compatible with
+GPLv3, so a built `libmatrix.so`, which contains the SDK, is distributed under GPLv3; the source
+itself stays usable under version 2 or, at your option, any later version.
