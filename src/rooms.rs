@@ -1,3 +1,14 @@
+// purple-matrix-rs: a libpurple protocol plugin for Matrix on the matrix-rust-sdk.
+// Copyright (C) 2026 the purple-matrix-rs authors
+//
+// This program is free software; you can redistribute it and/or modify it under the terms of the
+// GNU General Public License as published by the Free Software Foundation; either version 2 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+// even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License in the file LICENSE for more details.
+
 //! Sync, once the account is signed in: joined rooms as chats with their members, names and
 //! topics, history when a room opens, live messages, membership and topic changes, invitations.
 //!
