@@ -1412,16 +1412,19 @@ mod tests {
         //! The sync loop against a real Synapse, switched on by the environment and skipped with
         //! a message without it (the message shows only under `--nocapture`: the harness swallows the
         //! output of a passing test). The server is the dev server with the user `bob`, whose rooms
-        //! `#encrypted:localhost` and `#unencrypted:localhost` (members Admin, Bob, Tim; no
-        //! topic) this test asserts as they stand; it leaves them as it found them, bar one line
+        //! `#encrypted:localhost` and `#unencrypted:localhost` (no topic; bob and admin
+        //! are members, others may be) this test asserts as they stand; it leaves them as it found them, bar one line
         //! it sends as bob into the unencrypted room to see it arrive live, once. bob's account
         //! may be in use elsewhere while the test runs, so other rooms' events are let through.
         //!
         //! ```sh
         //! PURPLE_MATRIX_TEST_HOMESERVER=http://localhost:13622 \
-        //! PURPLE_MATRIX_TEST_TOKEN="$(op item get 'Matrix dev: bob' --vault Adium --fields 'label=access token' --reveal)" \
+        //! PURPLE_MATRIX_TEST_TOKEN=<access token of bob> \
         //! cargo test dev_server -- --nocapture
         //! ```
+        //!
+        //! `PURPLE_MATRIX_TEST_HOMESERVER` is the URL of the homeserver and
+        //! `PURPLE_MATRIX_TEST_TOKEN` an access token of a test user on it.
         //!
         //! The token stays in the environment and the client's memory: it is written to no file,
         //! and the SQLite stores go under a temp dir that is removed at the end.
@@ -1514,6 +1517,7 @@ mod tests {
                 .collect()
         }
 
+        /// The members the test names, sorted by user id. Other members are tolerated, unnamed.
         fn members() -> Vec<Member> {
             vec![
                 Member {
@@ -1524,11 +1528,35 @@ mod tests {
                     user_id: "@bob:localhost".to_owned(),
                     name: "Bob".to_owned(),
                 },
-                Member {
-                    user_id: "@tim:localhost".to_owned(),
-                    name: "Tim".to_owned(),
-                },
             ]
+        }
+
+        /// A chat's members cut down to the ones `members()` names, in the order of `members()`.
+        fn named_members(event: &Event) -> Option<Event> {
+            let Event::RoomJoined {
+                room_id,
+                name,
+                topic,
+                members: all,
+            } = event
+            else {
+                return None;
+            };
+            let mut named: Vec<Member> = all
+                .iter()
+                .filter(|m| members().contains(m))
+                .map(|m| Member {
+                    user_id: m.user_id.clone(),
+                    name: m.name.clone(),
+                })
+                .collect();
+            named.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+            Some(Event::RoomJoined {
+                room_id: room_id.clone(),
+                name: name.clone(),
+                topic: topic.clone(),
+                members: named,
+            })
         }
 
         /// Send a text line as bob through the client API and return its event id and server
@@ -1596,20 +1624,21 @@ mod tests {
                     user_id: "@bob:localhost".to_owned()
                 })
             );
-            let state: Vec<&Event> = opened
+            let state: Vec<Event> = opened
                 .iter()
                 .filter(|e| !is_line(e) && about(e, &[ENCRYPTED, UNENCRYPTED]))
+                .filter_map(named_members)
                 .collect();
             assert_eq!(
                 state,
                 vec![
-                    &Event::RoomJoined {
+                    Event::RoomJoined {
                         room_id: ENCRYPTED.to_owned(),
                         name: "Encrypted".to_owned(),
                         topic: None,
                         members: members(),
                     },
-                    &Event::RoomJoined {
+                    Event::RoomJoined {
                         room_id: UNENCRYPTED.to_owned(),
                         name: "Unencrypted".to_owned(),
                         topic: None,
