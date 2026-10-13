@@ -20,3 +20,10 @@ debug = "line-tables-only"
 
 [dev-dependencies]
 serde_json = "1.0.154"
+
+# The release build is the plugin that ships: stripped, one codegen unit and fat LTO, so a pinned
+# build in a client's repository stays as small as the SDK allows (°3309).
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
