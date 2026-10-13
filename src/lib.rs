@@ -2,19 +2,48 @@
 //!
 //! This library owns the matrix-rust-sdk client; `c/prpl.c` owns libpurple. The two meet at the
 //! `extern "C"` functions below, and nothing else crosses: strings go over as C strings that the
-//! Rust side allocates and frees, and every call that touches the SDK runs on the client's own
-//! Tokio runtime.
+//! Rust side allocates and frees, an account is an opaque handle, and every call that touches the
+//! SDK runs on the account's own runtime thread ([`runtime`]).
 //!
-//! What is here today is the skeleton that spec 001 builds on: the library reports itself and can
-//! build an SDK client with its SQLite stores, without touching the network.
+//! The C side calls in — `purple_matrix_account_new`, `_login`, `_close` — and is woken by the
+//! callback it registered when events wait; it collects them on its main thread with
+//! `purple_matrix_account_next_event`. No libpurple call is ever made from the runtime thread.
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+mod login;
+mod runtime;
 
-use matrix_sdk::Client;
+use std::ffi::{CStr, CString, c_void};
+use std::os::raw::{c_char, c_int};
+
+pub use login::{ErrorReason, LoginError};
+pub use runtime::{Account, Event};
 
 /// The matrix-sdk line this library is written against; the exact version is in `Cargo.lock`.
 const SDK_VERSION: &str = "0.19";
+
+/// `purple_matrix_account_next_event`'s answer when nothing waits.
+pub const EVENT_NONE: c_int = 0;
+/// `purple_matrix_account_next_event`'s answer for [`Event::Connected`]: the text is the user id.
+pub const EVENT_CONNECTED: c_int = 1;
+/// `purple_matrix_account_next_event`'s answer for [`Event::Error`]: the reason is set, the text
+/// is the message.
+pub const EVENT_ERROR: c_int = 2;
+
+/// The wake callback the C side registers: called on the runtime thread with its context.
+pub type WakeFn = unsafe extern "C" fn(ctx: *mut c_void);
+
+/// The callback's context, handed back as it came. Raw pointers are not `Send`; the C side owns
+/// what it points at and is the only one to read it, so carrying it across threads is sound.
+struct WakeContext(*mut c_void);
+unsafe impl Send for WakeContext {}
+unsafe impl Sync for WakeContext {}
+
+impl WakeContext {
+    /// Through a method, so a closure captures the wrapper and not the bare pointer in it.
+    fn ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
 
 /// A string for the C side; `purple_matrix_string_free` gives it back.
 fn into_c(s: String) -> *mut c_char {
@@ -39,42 +68,90 @@ pub extern "C" fn purple_matrix_version() -> *mut c_char {
     ))
 }
 
-/// Build an SDK client for `homeserver` with its SQLite stores under `store_dir`, without
-/// touching the network, and say what happened. The client is built and dropped on a runtime of
-/// its own: its SQLite pool needs a runtime context to go away, which a client that outlives a
-/// `block_on` no longer has.
+/// Start an account's runtime thread. `wake` is called with `ctx` on that thread whenever events
+/// wait; it must schedule `purple_matrix_account_next_event` on the main thread and nothing more.
+/// Null when the thread could not be started.
 ///
 /// # Safety
-/// Both arguments must be NUL-terminated strings that outlive the call.
+/// `wake` must stay callable, and `ctx` valid, until `purple_matrix_account_close`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn purple_matrix_client_probe(
-    homeserver: *const c_char,
-    store_dir: *const c_char,
-) -> *mut c_char {
-    let (homeserver, store_dir) = unsafe { (from_c(homeserver), from_c(store_dir)) };
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(r) => r,
-        Err(e) => return into_c(format!("no runtime: {e}")),
-    };
-    let answer = runtime.block_on(async {
-        match Client::builder()
-            .homeserver_url(&homeserver)
-            .sqlite_store(&store_dir, None)
-            .build()
-            .await
-        {
-            Ok(client) => {
-                let line = format!(
-                    "client built for {} with an SQLite store in {store_dir}",
-                    client.homeserver()
-                );
-                drop(client);
-                line
-            }
-            Err(e) => format!("client build failed: {e}"),
+pub unsafe extern "C" fn purple_matrix_account_new(
+    wake: Option<WakeFn>,
+    ctx: *mut c_void,
+) -> *mut Account {
+    let ctx = WakeContext(ctx);
+    let account = Account::new(move || {
+        if let Some(wake) = wake {
+            unsafe { wake(ctx.ptr()) }
         }
     });
-    into_c(answer)
+    match account {
+        Ok(account) => Box::into_raw(Box::new(account)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Sign in with `token` against `homeserver`, the SDK's stores under `store_dir`; the outcome
+/// arrives as an event.
+///
+/// # Safety
+/// `account` must come from `purple_matrix_account_new` and not be closed; the strings must be
+/// NUL-terminated and outlive the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn purple_matrix_account_login(
+    account: *mut Account,
+    homeserver: *const c_char,
+    store_dir: *const c_char,
+    token: *const c_char,
+) {
+    if account.is_null() {
+        return;
+    }
+    let (homeserver, store_dir, token) =
+        unsafe { (from_c(homeserver), from_c(store_dir), from_c(token)) };
+    unsafe { &*account }.login(&homeserver, &store_dir, &token);
+}
+
+/// The next event for libpurple, on the main thread: `EVENT_NONE` when the batch is collected,
+/// `EVENT_CONNECTED` with the user id in `text`, or `EVENT_ERROR` with the `PurpleConnectionError`
+/// value in `reason` and the message in `text`. `text` goes back with `purple_matrix_string_free`.
+///
+/// # Safety
+/// `account` must come from `purple_matrix_account_new` and not be closed; `reason` and `text`
+/// must be writable or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn purple_matrix_account_next_event(
+    account: *mut Account,
+    reason: *mut c_int,
+    text: *mut *mut c_char,
+) -> c_int {
+    if account.is_null() {
+        return EVENT_NONE;
+    }
+    let (kind, event_reason, event_text) = match unsafe { &*account }.next_event() {
+        None => return EVENT_NONE,
+        Some(Event::Connected { user_id }) => (EVENT_CONNECTED, 0, user_id),
+        Some(Event::Error { reason, message }) => (EVENT_ERROR, reason as c_int, message),
+    };
+    if !reason.is_null() {
+        unsafe { *reason = event_reason };
+    }
+    if !text.is_null() {
+        unsafe { *text = into_c(event_text) };
+    }
+    kind
+}
+
+/// Shut the account's runtime thread down, wait for it, and free the handle: the client is dropped
+/// on its runtime. No wake follows this call. Null is fine.
+///
+/// # Safety
+/// `account` must come from `purple_matrix_account_new` and not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn purple_matrix_account_close(account: *mut Account) {
+    if !account.is_null() {
+        unsafe { Box::from_raw(account) }.close();
+    }
 }
 
 /// Give back a string this library handed out.
@@ -90,6 +167,8 @@ pub unsafe extern "C" fn purple_matrix_string_free(s: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     fn take(s: *mut c_char) -> String {
@@ -101,28 +180,71 @@ mod tests {
     #[test]
     fn version_names_the_library_and_the_sdk() {
         let v = take(purple_matrix_version());
-        assert!(v.starts_with("purple-matrix-rs "));
-        assert!(v.contains("matrix-sdk"));
-    }
-
-    #[test]
-    fn a_client_builds_with_its_stores_and_without_network() {
-        let dir = std::env::temp_dir().join(format!("purple-matrix-rs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let homeserver = CString::new("https://matrix.example.org").expect("cstring");
-        let store = CString::new(dir.to_string_lossy().as_bytes()).expect("cstring");
-        let answer =
-            take(unsafe { purple_matrix_client_probe(homeserver.as_ptr(), store.as_ptr()) });
-        assert!(
-            answer.starts_with("client built for https://matrix.example.org/"),
-            "{answer}"
+        assert_eq!(
+            v,
+            format!(
+                "purple-matrix-rs {} on matrix-sdk 0.19",
+                env!("CARGO_PKG_VERSION")
+            )
         );
-        assert!(dir.join("matrix-sdk-crypto.sqlite3").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn freeing_null_is_fine() {
         unsafe { purple_matrix_string_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn closing_null_is_fine() {
+        unsafe { purple_matrix_account_close(std::ptr::null_mut()) };
+    }
+
+    /// The C wake callback a client would register: here it signals a channel whose sender is
+    /// the context.
+    unsafe extern "C" fn wake(ctx: *mut c_void) {
+        let sender = unsafe { &*(ctx as *const mpsc::Sender<()>) };
+        let _ = sender.send(());
+    }
+
+    #[test]
+    fn the_c_surface_wakes_and_hands_an_error_out_as_reason_and_text() {
+        let (tx, rx) = mpsc::channel::<()>();
+        let ctx = Box::into_raw(Box::new(tx));
+        let account = unsafe { purple_matrix_account_new(Some(wake), ctx as *mut c_void) };
+        assert!(!account.is_null());
+
+        let dir = std::env::temp_dir().join(format!("purple-matrix-rs-ffi-{}", std::process::id()));
+        // Port 1 on the loopback: nothing listens there, so the connection is refused.
+        let homeserver = CString::new("http://127.0.0.1:1").expect("cstring");
+        let store = CString::new(dir.to_string_lossy().as_bytes()).expect("cstring");
+        let token = CString::new("syt_ffi_probe_token").expect("cstring");
+        unsafe {
+            purple_matrix_account_login(
+                account,
+                homeserver.as_ptr(),
+                store.as_ptr(),
+                token.as_ptr(),
+            )
+        };
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the wake callback fires once the event waits");
+
+        let mut reason: c_int = -1;
+        let mut text: *mut c_char = std::ptr::null_mut();
+        let kind = unsafe { purple_matrix_account_next_event(account, &mut reason, &mut text) };
+        assert_eq!(kind, EVENT_ERROR);
+        assert_eq!(reason, ErrorReason::Network as c_int);
+        // The rest of the message is the OS's text for the refused connection, which varies.
+        let message = take(text);
+        assert!(
+            message.starts_with("the homeserver was not reached: "),
+            "{message}"
+        );
+        let kind = unsafe { purple_matrix_account_next_event(account, &mut reason, &mut text) };
+        assert_eq!(kind, EVENT_NONE);
+
+        unsafe { purple_matrix_account_close(account) };
+        drop(unsafe { Box::from_raw(ctx) });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -65,6 +65,11 @@ plugin: build
         -framework Security -framework CoreFoundation -framework SystemConfiguration \
         -lsqlite3 -liconv -lresolv -lc++
     rm -f plugin/prpl.o
+    if [[ -n "{{adium}}" ]]; then
+        # The linker's own signature is what Xcode's copy phase strips; an ad-hoc one survives it
+        # (Adium's Utilities/verify-purple-plugins.sh checks for exactly that).
+        codesign -f -s - plugin/libmatrix.so
+    fi
     echo "plugin/libmatrix.so: $(du -h plugin/libmatrix.so | cut -f1)"
 
 [doc("Delete the build output — run before every push")]
