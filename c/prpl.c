@@ -88,7 +88,7 @@ static PurplePluginInfo info = {
 	"0.1.0",                                  /* version */
 	"Matrix protocol plugin",                 /* summary */
 	"Matrix on the matrix-rust-sdk, end-to-end encryption included",
-	"Tim Otlik",                              /* author */
+	"the purple-matrix-rs authors",           /* author */
 	"https://github.com/iilonmasc/purple-matrix-rs",
 	matrix_plugin_load,                       /* load */
 	NULL,                                     /* unload */
