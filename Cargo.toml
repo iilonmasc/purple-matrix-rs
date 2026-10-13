@@ -7,6 +7,9 @@ license = "GPL-2.0-or-later"
 description = "A libpurple protocol plugin for Matrix on the matrix-rust-sdk, end-to-end encryption included"
 repository = "https://github.com/iilonmasc/purple-matrix-rs"
 
+[package.metadata.purple-matrix-rs]
+version-date = "2026-10-13"
+
 [lib]
 crate-type = ["staticlib"]
 
