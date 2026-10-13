@@ -368,6 +368,41 @@ pub unsafe extern "C" fn purple_matrix_account_join(account: *mut Account, room_
     unsafe { &*account }.join(&room_id);
 }
 
+/// The window of the chat for `room_id` was closed: the account stays in the room.
+///
+/// # Safety
+/// `account` must come from `purple_matrix_account_new` and not be closed; `room_id` must be
+/// NUL-terminated and outlive the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn purple_matrix_account_close_chat(
+    account: *mut Account,
+    room_id: *const c_char,
+) {
+    if account.is_null() {
+        return;
+    }
+    let room_id = unsafe { from_c(room_id) };
+    unsafe { &*account }.close_chat(&room_id);
+}
+
+/// Leave the room with `room_id` on the server; the chat ends as a `ROOM_LEFT`, a failure is a
+/// `LEAVE_FAILED`.
+///
+/// # Safety
+/// `account` must come from `purple_matrix_account_new` and not be closed; `room_id` must be
+/// NUL-terminated and outlive the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn purple_matrix_account_leave(
+    account: *mut Account,
+    room_id: *const c_char,
+) {
+    if account.is_null() {
+        return;
+    }
+    let room_id = unsafe { from_c(room_id) };
+    unsafe { &*account }.leave(&room_id);
+}
+
 /// Send `body`, plain text, into the room with `room_id`. The line shows when the server's echo
 /// arrives as a `MESSAGE`; a failure is a `SEND_FAILED`.
 ///

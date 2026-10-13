@@ -99,6 +99,12 @@ pub async fn serve(
         held: VecDeque::new(),
     };
     let mut rooms = Rooms::default();
+    // The rooms the store already knows open before the first sync answers: with a store that is
+    // not new, that sync is incremental and waits out its long poll in a quiet account.
+    let from_store = rooms.open_joined(client, outbox);
+    if inbox.until_shutdown(from_store).await.is_none() {
+        return Stopped::Shutdown;
+    }
     let mut failures = 0usize;
     loop {
         let delay = failures.checked_sub(1).map(|i| RETRY_DELAYS[i]);
@@ -136,6 +142,13 @@ pub async fn serve(
                     Some(Command::Shutdown) | None => return Stopped::Shutdown,
                     Some(Command::Join { room_id }) => {
                         let work = rooms.join(client, &room_id, outbox);
+                        if inbox.until_shutdown(work).await.is_none() {
+                            return Stopped::Shutdown;
+                        }
+                    }
+                    Some(Command::Close { room_id }) => rooms.close(&room_id),
+                    Some(Command::Leave { room_id }) => {
+                        let work = rooms.leave(client, &room_id, outbox);
                         if inbox.until_shutdown(work).await.is_none() {
                             return Stopped::Shutdown;
                         }
@@ -190,6 +203,9 @@ fn reason_of(e: &Error) -> ErrorReason {
 struct Rooms {
     /// The chats open on the libpurple side.
     open: HashMap<OwnedRoomId, Chat>,
+    /// The joined rooms whose window was closed: the account stays in them, a sync does not
+    /// bring them back, and a join opens them again.
+    closed: HashSet<OwnedRoomId>,
     /// The invitations announced, so a sync that carries one again does not announce it twice.
     invited: HashSet<OwnedRoomId>,
 }
@@ -198,7 +214,7 @@ impl Rooms {
     async fn after_sync(&mut self, client: &Client, response: &SyncResponse, outbox: &Outbox) {
         let mut fresh = HashSet::new();
         for room in sorted(client.joined_rooms()) {
-            if !self.open.contains_key(room.room_id()) {
+            if !self.open.contains_key(room.room_id()) && !self.closed.contains(room.room_id()) {
                 self.open(&room, outbox).await;
                 fresh.insert(room.room_id().to_owned());
             }
@@ -229,11 +245,19 @@ impl Rooms {
                 });
             }
             self.invited.remove(room_id);
+            self.closed.remove(room_id);
         }
         for room in sorted(client.invited_rooms()) {
             if self.invited.insert(room.room_id().to_owned()) {
                 announce(&room, outbox).await;
             }
+        }
+    }
+
+    /// Open every joined room the client already knows, from its store.
+    async fn open_joined(&mut self, client: &Client, outbox: &Outbox) {
+        for room in sorted(client.joined_rooms()) {
+            self.open(&room, outbox).await;
         }
     }
 
@@ -288,8 +312,10 @@ impl Rooms {
         self.open.insert(room_id.to_owned(), chat);
     }
 
-    /// Accept an invitation, or join a room by its id; the chat opens with the next sync.
-    async fn join(&self, client: &Client, room_id: &str, outbox: &Outbox) {
+    /// Open a room by its id. A room the account is in opens from the state right away, with the
+    /// members, name, topic and history it has on connect (a reopened window, a bookmark); an
+    /// invitation is accepted and any other room joined, and the chat opens with the next sync.
+    async fn join(&mut self, client: &Client, room_id: &str, outbox: &Outbox) {
         let failed = |message: String| Event::JoinFailed {
             room_id: room_id.to_owned(),
             message,
@@ -298,6 +324,17 @@ impl Rooms {
             outbox.push(failed(format!("{room_id} is not a room id")));
             return;
         };
+        if let Some(room) = client
+            .get_room(&id)
+            .filter(|room| room.state() == RoomState::Joined)
+        {
+            // A window that is open already has nothing to be told again.
+            if !self.open.contains_key(&id) {
+                self.closed.remove(&id);
+                self.open(&room, outbox).await;
+            }
+            return;
+        }
         if let Err(e) = client.join_room_by_id(&id).await {
             outbox.push(failed(e.to_string()));
         }
@@ -325,6 +362,36 @@ impl Rooms {
             .await
         {
             outbox.push(failed(e.to_string(), body));
+        }
+    }
+
+    /// The window of a room was closed: forget the chat and what was shown in it. The account
+    /// stays in the room; nothing goes to the server.
+    fn close(&mut self, room_id: &str) {
+        let Ok(id) = RoomId::parse(room_id) else {
+            return;
+        };
+        if self.open.remove(&id).is_some() {
+            self.closed.insert(id);
+        }
+    }
+
+    /// Leave a joined room on the server. The chat closes when the sync reports the room as left.
+    async fn leave(&mut self, client: &Client, room_id: &str, outbox: &Outbox) {
+        let failed = |message: String| Event::LeaveFailed {
+            room_id: room_id.to_owned(),
+            message,
+        };
+        let room = RoomId::parse(room_id)
+            .ok()
+            .and_then(|id| client.get_room(&id))
+            .filter(|room| room.state() == RoomState::Joined);
+        let Some(room) = room else {
+            outbox.push(failed("the room is not joined".to_owned()));
+            return;
+        };
+        if let Err(e) = room.leave().await {
+            outbox.push(failed(e.to_string()));
         }
     }
 
@@ -1086,7 +1153,12 @@ mod tests {
                 ("POST", t) if t.contains("!secret:localhost/join") => {
                     ("200 OK", json!({"room_id": SECRET}))
                 }
-                ("POST", t) if t.contains("!spam:localhost/leave") => ("200 OK", json!({})),
+                ("POST", t)
+                    if t.contains("!spam:localhost/leave")
+                        || t.contains("!general:localhost/leave") =>
+                {
+                    ("200 OK", json!({}))
+                }
                 _ => (
                     "404 Not Found",
                     json!({"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"}),
@@ -1437,6 +1509,187 @@ mod tests {
                 ]
             );
             account.close();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The joined room of the tests below, as its first sync brings it.
+        fn general_joined() -> Scripted {
+            Scripted {
+                gate: None,
+                body: json!({"next_batch": "s1", "rooms": {"join": {GENERAL: {
+                    "state": {"events": [
+                        state_event("m.room.create", "@alice:localhost", json!({"creator": "@alice:localhost", "room_version": "10"})),
+                        state_event("m.room.name", "@alice:localhost", json!({"name": "General"})),
+                        state_event("m.room.topic", "@alice:localhost", json!({"topic": "Chatter"})),
+                        member(GENERAL, "@alice:localhost", "join", Some("Alice")),
+                        member(GENERAL, "@probe:localhost", "join", Some("Probe")),
+                    ]},
+                    "timeline": {"events": [], "limited": false, "prev_batch": "p1"}
+                }}}}),
+            }
+        }
+
+        /// What opening `GENERAL` tells libpurple: the chat, then the history the mock serves.
+        fn general_opened() -> Vec<Event> {
+            vec![
+                Event::RoomJoined {
+                    room_id: room(GENERAL),
+                    name: "General".to_owned(),
+                    topic: Some("Chatter".to_owned()),
+                    members: vec![
+                        Member {
+                            user_id: "@alice:localhost".to_owned(),
+                            name: "Alice".to_owned(),
+                        },
+                        Member {
+                            user_id: "@probe:localhost".to_owned(),
+                            name: "Probe".to_owned(),
+                        },
+                    ],
+                },
+                Event::Message {
+                    room_id: room(GENERAL),
+                    event_id: "$m0:localhost".to_owned(),
+                    sender: "Probe".to_owned(),
+                    body: "welcome".to_owned(),
+                    timestamp: 1_699_999_000,
+                },
+                Event::Message {
+                    room_id: room(GENERAL),
+                    event_id: "$m1:localhost".to_owned(),
+                    sender: "Alice".to_owned(),
+                    body: "hello".to_owned(),
+                    timestamp: 1_700_000_000,
+                },
+            ]
+        }
+
+        #[test]
+        fn a_closed_window_keeps_the_room_a_join_reopens_it_from_state_and_leave_reaches_the_server()
+         {
+            let homeserver = Homeserver::start(vec![
+                general_joined(),
+                // A line arrives while the window is closed; it is shown by nobody.
+                Scripted {
+                    gate: Some("/send/m.room.message/"),
+                    body: json!({"next_batch": "s2", "rooms": {"join": {GENERAL: {
+                        "timeline": {"events": [
+                            message("$closed:localhost", "@alice:localhost", "while closed", 1_700_000_500_000u64),
+                        ], "limited": false}
+                    }}}}),
+                },
+                Scripted {
+                    gate: Some("!general:localhost/leave"),
+                    body: json!({"next_batch": "s3", "rooms": {"leave": {GENERAL: {}}}}),
+                },
+            ]);
+            let dir = std::env::temp_dir().join(format!(
+                "purple-matrix-rs-loopback-reopen-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (account, woken) = account();
+            account.login(
+                &homeserver.url,
+                &dir.to_string_lossy(),
+                "syt_loopback_token",
+            );
+            let opened = collect(&homeserver, &account, &woken, 4);
+            assert_eq!(opened[1..], general_opened());
+
+            // Closing the window sends nothing; the sync that follows does not bring it back.
+            account.close_chat(GENERAL);
+            account.send(GENERAL, "poke");
+            homeserver.await_syncs(3);
+            assert_eq!(account.next_event(), None);
+
+            // A bookmark on the room opens it again, from state, with no join request.
+            account.join(GENERAL);
+            let reopened = collect(&homeserver, &account, &woken, 3);
+            assert_eq!(reopened, general_opened());
+            assert!(
+                !homeserver.seen().iter().any(|l| l.contains("/join")),
+                "{:?}",
+                homeserver.seen()
+            );
+
+            // A join on a room already open tells nobody again.
+            account.join(GENERAL);
+            // A room never joined is joined on the server; the mock refuses it.
+            account.join("!fresh:localhost");
+            let refused = collect(&homeserver, &account, &woken, 1);
+            assert_eq!(
+                refused,
+                vec![Event::JoinFailed {
+                    room_id: "!fresh:localhost".to_owned(),
+                    message:
+                        "the server returned an error: [404 / M_UNRECOGNIZED] Unrecognized request"
+                            .to_owned(),
+                }]
+            );
+            assert_eq!(
+                homeserver
+                    .seen()
+                    .iter()
+                    .filter(|l| l.contains("/join"))
+                    .collect::<Vec<_>>(),
+                vec!["POST /_matrix/client/v3/rooms/!fresh:localhost/join"]
+            );
+
+            // /leave goes to the server, and the sync that reports the room as left ends the chat.
+            account.leave(GENERAL);
+            assert_eq!(
+                collect(&homeserver, &account, &woken, 1),
+                vec![Event::RoomLeft {
+                    room_id: room(GENERAL)
+                }]
+            );
+            assert!(
+                homeserver
+                    .seen()
+                    .contains(&"POST /_matrix/client/v3/rooms/!general:localhost/leave".to_owned())
+            );
+
+            // Leaving a room the account is not in says so without a request.
+            account.leave(GENERAL);
+            assert_eq!(
+                collect(&homeserver, &account, &woken, 1),
+                vec![Event::LeaveFailed {
+                    room_id: room(GENERAL),
+                    message: "the room is not joined".to_owned(),
+                }]
+            );
+            account.close();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_second_sign_in_on_the_same_store_opens_the_rooms_before_the_first_sync_answers() {
+            let dir = std::env::temp_dir().join(format!(
+                "purple-matrix-rs-loopback-store-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let first = Homeserver::start(vec![general_joined()]);
+            let (once, woken) = account();
+            once.login(&first.url, &dir.to_string_lossy(), "syt_loopback_token");
+            assert_eq!(collect(&first, &once, &woken, 4)[1..], general_opened());
+            once.close();
+
+            // This homeserver answers no sync at all: whatever arrives came from the store.
+            let second = Homeserver::start(Vec::new());
+            let (again, woken) = account();
+            again.login(&second.url, &dir.to_string_lossy(), "syt_loopback_token");
+            let events = collect(&second, &again, &woken, 4);
+            assert_eq!(
+                events[0],
+                Event::Connected {
+                    user_id: "@probe:localhost".to_owned()
+                }
+            );
+            assert_eq!(events[1..], general_opened());
+            again.close();
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1810,6 +2063,26 @@ mod tests {
             })
         }
 
+        /// Create a room as bob, with nobody invited, and return its id.
+        fn create_room_as_bob(homeserver: &str, token: &str, name: &str) -> String {
+            let runtime = tokio::runtime::Runtime::new().expect("a runtime for the API calls");
+            runtime.block_on(async {
+                let bytes = matrix_sdk::reqwest::Client::new()
+                    .post(format!("{homeserver}/_matrix/client/v3/createRoom"))
+                    .bearer_auth(token)
+                    .header("Content-Type", "application/json")
+                    .body(json!({"name": name}).to_string())
+                    .send()
+                    .await
+                    .expect("the createRoom request")
+                    .bytes()
+                    .await
+                    .expect("the createRoom answer");
+                let created: Value = serde_json::from_slice(&bytes).expect("json");
+                created["room_id"].as_str().expect("a room id").to_owned()
+            })
+        }
+
         /// The event as the homeserver holds it, undecrypted: `GET .../event/<id>`.
         fn raw_event(homeserver: &str, token: &str, room_id: &str, event_id: &str) -> Value {
             let runtime = tokio::runtime::Runtime::new().expect("a runtime for the API calls");
@@ -1969,6 +2242,64 @@ mod tests {
             assert_eq!(distinct.len(), shown.len(), "a line shown twice: {shown:?}");
             assert_eq!(shown.iter().filter(|id| **id == event_id).count(), 1);
 
+            account.close();
+        }
+
+        #[test]
+        fn a_closed_window_reopens_from_state_and_leave_leaves_a_room_made_for_it() {
+            let Some((homeserver, token, dir, _store)) = settings() else {
+                return;
+            };
+            let (account, woken) = account();
+            account.login(&homeserver, &dir.to_string_lossy(), &token);
+            collect_until(
+                &account,
+                &woken,
+                |e| matches!(e, Event::RoomJoined { room_id, .. } if room_id == UNENCRYPTED),
+            );
+
+            // Closing the window and opening the room again: the chat with its members, and
+            // the account is still in the room, so nothing is joined.
+            account.close_chat(UNENCRYPTED);
+            account.join(UNENCRYPTED);
+            let reopened = collect_until(
+                &account,
+                &woken,
+                |e| matches!(e, Event::RoomJoined { room_id, .. } if room_id == UNENCRYPTED),
+            );
+            let state: Vec<Event> = reopened
+                .iter()
+                .filter(|e| about(e, &[UNENCRYPTED]))
+                .filter_map(named_members)
+                .collect();
+            assert_eq!(
+                state,
+                vec![Event::RoomJoined {
+                    room_id: UNENCRYPTED.to_owned(),
+                    name: "Unencrypted".to_owned(),
+                    topic: None,
+                    members: members(),
+                }]
+            );
+
+            // A room made for the test, so bob stays in the two others. It stays behind, left.
+            let name = format!("purple-matrix-rs leave test {}", std::process::id());
+            let made = create_room_as_bob(&homeserver, &token, &name);
+            collect_until(
+                &account,
+                &woken,
+                |e| matches!(e, Event::RoomJoined { room_id, .. } if *room_id == made),
+            );
+            account.leave(&made);
+            let left = collect_until(
+                &account,
+                &woken,
+                |e| matches!(e, Event::RoomLeft { room_id } if *room_id == made),
+            );
+            assert!(
+                left.iter().all(|e| !matches!(e, Event::LeaveFailed { .. })),
+                "{left:?}"
+            );
             account.close();
         }
     }

@@ -27,12 +27,21 @@ pub(crate) enum Command {
         store_dir: String,
         token: String,
     },
-    /// Join the room, or accept the invitation to it; the chat opens with the next sync.
+    /// Open the room: from the state when the account is in it, else join, or accept the
+    /// invitation; then the chat opens with the next sync.
     Join {
         room_id: String,
     },
     /// Decline the invitation to the room.
     Reject {
+        room_id: String,
+    },
+    /// The chat's window was closed: forget the chat, stay in the room.
+    Close {
+        room_id: String,
+    },
+    /// Leave the room on the server; the chat closes when the sync reports the room as left.
+    Leave {
         room_id: String,
     },
     /// Send `body` as a text message into the room; the line appears when the sync delivers the
@@ -228,6 +237,23 @@ impl Account {
         });
     }
 
+    /// The window of the chat was closed. The account stays in the room: the chat is forgotten
+    /// here, nothing goes to the server, and a later [`Account::join`] opens it again from the
+    /// state.
+    pub fn close_chat(&self, room_id: &str) {
+        let _ = self.commands.send(Command::Close {
+            room_id: room_id.to_owned(),
+        });
+    }
+
+    /// Leave the room on the server; the chat ends as an [`Event::RoomLeft`] with the next sync,
+    /// or an [`Event::LeaveFailed`] says why not.
+    pub fn leave(&self, room_id: &str) {
+        let _ = self.commands.send(Command::Leave {
+            room_id: room_id.to_owned(),
+        });
+    }
+
     /// Send `body` as a text message into the room. Nothing comes back on success but the
     /// server's echo, an [`Event::Message`] with the next sync; an [`Event::SendFailed`] says why not.
     pub fn send(&self, room_id: &str, body: &str) {
@@ -279,7 +305,10 @@ fn refuse(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>, e: s
                 message: format!("no runtime for the account: {e}"),
             }),
             Command::Send { room_id, body } => outbox.push(send_refused(room_id, body)),
-            Command::Join { .. } | Command::Reject { .. } => {}
+            Command::Join { .. }
+            | Command::Reject { .. }
+            | Command::Close { .. }
+            | Command::Leave { .. } => {}
             Command::Shutdown => return,
         }
     }
@@ -326,7 +355,12 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
                             Some(Command::Send { room_id, body }) => {
                                 outbox.push(send_refused(room_id, body));
                             }
-                            Some(Command::Join { .. } | Command::Reject { .. }) => {}
+                            Some(
+                                Command::Join { .. }
+                                | Command::Reject { .. }
+                                | Command::Close { .. }
+                                | Command::Leave { .. },
+                            ) => {}
                         },
                     }
                 }
@@ -340,7 +374,10 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
             // After a sync failed for good there is no room to join; libpurple's close follows.
             // A line typed meanwhile is told, not dropped.
             Command::Send { room_id, body } => outbox.push(send_refused(room_id, body)),
-            Command::Join { .. } | Command::Reject { .. } => {}
+            Command::Join { .. }
+            | Command::Reject { .. }
+            | Command::Close { .. }
+            | Command::Leave { .. } => {}
             Command::Shutdown => break,
         }
     }

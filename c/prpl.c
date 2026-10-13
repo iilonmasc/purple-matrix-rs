@@ -22,6 +22,7 @@
 
 #include "account.h"
 #include "accountopt.h"
+#include "cmds.h"
 #include "connection.h"
 #include "conversation.h"
 #include "debug.h"
@@ -64,6 +65,8 @@ extern purple_matrix_account *purple_matrix_account_new(void (*wake)(void *ctx),
 extern void purple_matrix_account_login(purple_matrix_account *account, const char *homeserver,
                                         const char *store_dir, const char *token);
 extern void purple_matrix_account_join(purple_matrix_account *account, const char *room_id);
+extern void purple_matrix_account_close_chat(purple_matrix_account *account, const char *room_id);
+extern void purple_matrix_account_leave(purple_matrix_account *account, const char *room_id);
 extern void purple_matrix_account_reject(purple_matrix_account *account, const char *room_id);
 extern void purple_matrix_account_send(purple_matrix_account *account, const char *room_id, const char *body);
 extern purple_matrix_event *purple_matrix_account_next_event(purple_matrix_account *account);
@@ -360,6 +363,32 @@ static void matrix_reject_chat(PurpleConnection *pc, GHashTable *components)
 		purple_matrix_account_reject(handle, room_id);
 }
 
+/* The window of a chat was closed. That is not leaving the room (decision 6): the account stays
+ * in it, nothing goes to the server, and a bookmark or a reconnect brings the room back. */
+static void matrix_chat_leave(PurpleConnection *pc, int id)
+{
+	purple_matrix_account *handle = purple_connection_get_protocol_data(pc);
+	PurpleConversation *conv = purple_find_chat(pc, id);
+
+	if (handle && conv)
+		purple_matrix_account_close_chat(handle, purple_conversation_get_name(conv));
+}
+
+static PurpleCmdId leave_cmd_id = 0;
+
+/* /leave: leave the room on the server. The chat ends when the sync reports the room as left;
+ * a failure comes back as an error. */
+static PurpleCmdRet matrix_cmd_leave(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	PurpleConnection *pc = purple_conversation_get_gc(conv);
+	purple_matrix_account *handle = pc ? purple_connection_get_protocol_data(pc) : NULL;
+
+	if (purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT || !handle)
+		return PURPLE_CMD_RET_FAILED;
+	purple_matrix_account_leave(handle, purple_conversation_get_name(conv));
+	return PURPLE_CMD_RET_OK;
+}
+
 /* Typed into a chat: libpurple hands HTML, the room gets plain text. Nothing is written here
  * (libpurple does not echo chat messages itself); the line is the server's echo, once it
  * arrives. 0 means the message is on its way. */
@@ -383,6 +412,18 @@ static gboolean matrix_plugin_load(PurplePlugin *plugin)
 	char *version = purple_matrix_version();
 	purple_debug_info("matrix", "loaded: %s\n", version);
 	purple_matrix_string_free(version);
+	leave_cmd_id = purple_cmd_register("leave", "", PURPLE_CMD_P_PRPL,
+		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PRPL_ONLY, PRPL_ID,
+		matrix_cmd_leave, "leave:  Leave this room for good.", NULL);
+	return TRUE;
+}
+
+static gboolean matrix_plugin_unload(PurplePlugin *plugin)
+{
+	if (leave_cmd_id) {
+		purple_cmd_unregister(leave_cmd_id);
+		leave_cmd_id = 0;
+	}
 	return TRUE;
 }
 
@@ -405,7 +446,7 @@ static PurplePluginInfo info = {
 	"the purple-matrix-rs authors",           /* author */
 	"https://github.com/iilonmasc/purple-matrix-rs",
 	matrix_plugin_load,                       /* load */
-	NULL,                                     /* unload */
+	matrix_plugin_unload,                     /* unload */
 	NULL,                                     /* destroy */
 	NULL,                                     /* ui_info */
 	&prpl_info,                               /* extra_info */
@@ -428,6 +469,7 @@ static void matrix_plugin_init(PurplePlugin *plugin)
 	prpl_info.get_chat_name = matrix_get_chat_name;
 	prpl_info.join_chat = matrix_join_chat;
 	prpl_info.reject_chat = matrix_reject_chat;
+	prpl_info.chat_leave = matrix_chat_leave;
 	prpl_info.chat_send = matrix_chat_send;
 
 	prpl_info.protocol_options = g_list_append(NULL,
