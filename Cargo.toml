@@ -17,3 +17,6 @@ tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "sync"] }
 
 [profile.dev]
 debug = "line-tables-only"
+
+[dev-dependencies]
+serde_json = "1.0.154"
