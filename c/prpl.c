@@ -18,6 +18,7 @@
 #include <glib.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include "account.h"
 #include "accountopt.h"
@@ -64,6 +65,7 @@ extern void purple_matrix_account_login(purple_matrix_account *account, const ch
                                         const char *store_dir, const char *token);
 extern void purple_matrix_account_join(purple_matrix_account *account, const char *room_id);
 extern void purple_matrix_account_reject(purple_matrix_account *account, const char *room_id);
+extern void purple_matrix_account_send(purple_matrix_account *account, const char *room_id, const char *body);
 extern purple_matrix_event *purple_matrix_account_next_event(purple_matrix_account *account);
 extern void purple_matrix_event_free(purple_matrix_event *event);
 extern void purple_matrix_account_close(purple_matrix_account *account);
@@ -85,7 +87,8 @@ enum {
 	MATRIX_EVENT_NOTICE = 11,
 	MATRIX_EVENT_INVITED = 12,
 	MATRIX_EVENT_JOIN_FAILED = 13,
-	MATRIX_EVENT_LEAVE_FAILED = 14
+	MATRIX_EVENT_LEAVE_FAILED = 14,
+	MATRIX_EVENT_SEND_FAILED = 15
 };
 
 /* The one component of a chat: the room id. A bookmark carries it, an invite's data carries it,
@@ -150,7 +153,7 @@ static void matrix_chat_event(PurpleConnection *pc, const purple_matrix_event *e
 {
 	PurpleConversation *conv = purple_find_chat(pc, matrix_chat_id(ev->room_id));
 	PurpleConvChat *chat;
-	char *html;
+	char *html, *text, *line;
 
 	if (!conv)
 		return;
@@ -174,7 +177,22 @@ static void matrix_chat_event(PurpleConnection *pc, const purple_matrix_event *e
 	case MATRIX_EVENT_MESSAGE:
 		/* The body is plain text; libpurple reads HTML. */
 		html = g_markup_escape_text(ev->text, -1);
-		serv_got_chat_in(pc, matrix_chat_id(ev->room_id), ev->name, PURPLE_MESSAGE_RECV, html, (time_t) ev->timestamp);
+		if (g_strcmp0(ev->name, purple_conv_chat_get_nick(chat)) == 0) {
+			/* The server's echo of what the account sent: the plugin wrote no line at send time,
+			 * so this is the account's own line, once. */
+			purple_conv_chat_write(chat, ev->name, html, PURPLE_MESSAGE_SEND, (time_t) ev->timestamp);
+		} else {
+			serv_got_chat_in(pc, matrix_chat_id(ev->room_id), ev->name, PURPLE_MESSAGE_RECV, html, (time_t) ev->timestamp);
+		}
+		g_free(html);
+		break;
+	case MATRIX_EVENT_SEND_FAILED:
+		html = g_markup_escape_text(ev->text, -1);
+		text = g_markup_escape_text(ev->name, -1);
+		line = g_strdup_printf("Could not send \"%s\": %s", text, html);
+		purple_conv_chat_write(chat, "", line, PURPLE_MESSAGE_ERROR, time(NULL));
+		g_free(line);
+		g_free(text);
 		g_free(html);
 		break;
 	case MATRIX_EVENT_NOTICE:
@@ -342,6 +360,24 @@ static void matrix_reject_chat(PurpleConnection *pc, GHashTable *components)
 		purple_matrix_account_reject(handle, room_id);
 }
 
+/* Typed into a chat: libpurple hands HTML, the room gets plain text. Nothing is written here
+ * (libpurple does not echo chat messages itself); the line is the server's echo, once it
+ * arrives. 0 means the message is on its way. */
+static int matrix_chat_send(PurpleConnection *pc, int id, const char *message, PurpleMessageFlags flags)
+{
+	purple_matrix_account *handle = purple_connection_get_protocol_data(pc);
+	PurpleConversation *conv = purple_find_chat(pc, id);
+	char *plain;
+
+	if (!handle || !conv)
+		return -1;
+	/* Strips the tags, turns <br> into newlines and resolves the entities. */
+	plain = purple_markup_strip_html(message);
+	purple_matrix_account_send(handle, purple_conversation_get_name(conv), plain);
+	g_free(plain);
+	return 0;
+}
+
 static gboolean matrix_plugin_load(PurplePlugin *plugin)
 {
 	char *version = purple_matrix_version();
@@ -392,6 +428,7 @@ static void matrix_plugin_init(PurplePlugin *plugin)
 	prpl_info.get_chat_name = matrix_get_chat_name;
 	prpl_info.join_chat = matrix_join_chat;
 	prpl_info.reject_chat = matrix_reject_chat;
+	prpl_info.chat_send = matrix_chat_send;
 
 	prpl_info.protocol_options = g_list_append(NULL,
 		purple_account_option_string_new("Home server URL", OPT_HOME_SERVER, "https://matrix.org"));
