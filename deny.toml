@@ -14,7 +14,7 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# The maintainer's own crates: this workspace's (publish = false) and the
+# The workspace's own crate (publish = false) needs no licence check.
 # orbitstack registry's.
 [licenses.private]
 ignore = true
