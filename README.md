@@ -38,7 +38,7 @@ headers and libraries of the client to build for.
     just plugin                                  # against pkg-config's libpurple
     ADIUM=~/path/to/adium just plugin            # against Adium's bundled frameworks
 
-`check` also runs the fleet tools `medic` and `bumper` where they are installed, and keeps a green
+`check` also runs the maintainer's `medic` and `bumper` where they are installed, and keeps a green
 run silent with `chronic` where that is; none of the three is needed.
 
 ## Licence

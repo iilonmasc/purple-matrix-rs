@@ -14,7 +14,7 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# The fleet's own crates: this workspace's (publish = false) and the
+# The maintainer's own crates: this workspace's (publish = false) and the
 # orbitstack registry's.
 [licenses.private]
 ignore = true

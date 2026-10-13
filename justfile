@@ -5,8 +5,8 @@
 #
 # Needs: a stable Rust toolchain, just, clang, and for `check` cargo-deny and
 # cargo-machete. Three more are used when installed and skipped when not, so a
-# clone outside Tim's fleet works as it is: chronic (moreutils) keeps a green
-# gate silent, medic and bumper are the fleet's repository and release checks.
+# clone anywhere works as it is: chronic (moreutils) keeps a green
+# gate silent, medic and bumper are the maintainer's repository and release checks.
 
 chronic := `command -v chronic >/dev/null 2>&1 && echo chronic || true`
 medic := `command -v medic || true`
