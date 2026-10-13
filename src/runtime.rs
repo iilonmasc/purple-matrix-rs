@@ -261,6 +261,15 @@ fn serve(inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
     }
 }
 
+/// The answer to a line typed while there is no signed-in client to send it.
+fn send_refused(room_id: String, text: String) -> Event {
+    Event::SendFailed {
+        room_id,
+        text,
+        message: "the account is not connected".to_owned(),
+    }
+}
+
 /// Without a runtime there is no client: every sign-in is answered with the reason.
 fn refuse(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>, e: std::io::Error) {
     while let Some(command) = inbox.blocking_recv() {
@@ -269,7 +278,8 @@ fn refuse(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>, e: s
                 reason: ErrorReason::Other,
                 message: format!("no runtime for the account: {e}"),
             }),
-            Command::Join { .. } | Command::Reject { .. } | Command::Send { .. } => {}
+            Command::Send { room_id, body } => outbox.push(send_refused(room_id, body)),
+            Command::Join { .. } | Command::Reject { .. } => {}
             Command::Shutdown => return,
         }
     }
@@ -311,8 +321,12 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
                                 reason: ErrorReason::Other,
                                 message: "a sign-in is already under way".to_owned(),
                             }),
-                            // Nothing to join before the account is signed in.
-                            Some(Command::Join { .. } | Command::Reject { .. } | Command::Send { .. }) => {}
+                            // Nothing to join before the account is signed in; a line typed
+                            // meanwhile is not lost silently.
+                            Some(Command::Send { room_id, body }) => {
+                                outbox.push(send_refused(room_id, body));
+                            }
+                            Some(Command::Join { .. } | Command::Reject { .. }) => {}
                         },
                     }
                 }
@@ -324,7 +338,9 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
                 }
             }
             // After a sync failed for good there is no room to join; libpurple's close follows.
-            Command::Join { .. } | Command::Reject { .. } | Command::Send { .. } => {}
+            // A line typed meanwhile is told, not dropped.
+            Command::Send { room_id, body } => outbox.push(send_refused(room_id, body)),
+            Command::Join { .. } | Command::Reject { .. } => {}
             Command::Shutdown => break,
         }
     }
@@ -526,6 +542,27 @@ mod tests {
                 reason: ErrorReason::AuthenticationFailed,
                 message: "no access token: put it in the password field".to_owned(),
             }
+        );
+        account.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_typed_during_the_sign_in_is_reported_as_not_sent() {
+        let dir = store_dir("send-during-login");
+        let (account, woken) = account();
+        account.login(&homeserver_silent(), &dir.to_string_lossy(), TOKEN);
+        account.send("!room:localhost", "typed too early");
+        woken
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the refusal wakes the main thread");
+        assert_eq!(
+            account.next_event(),
+            Some(Event::SendFailed {
+                room_id: "!room:localhost".to_owned(),
+                text: "typed too early".to_owned(),
+                message: "the account is not connected".to_owned(),
+            })
         );
         account.close();
         let _ = std::fs::remove_dir_all(&dir);
