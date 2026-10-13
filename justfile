@@ -76,6 +76,8 @@ plugin: build
         -framework Security -framework CoreFoundation -framework SystemConfiguration \
         -lsqlite3 -liconv -lresolv -lc++
     rm -f plugin/prpl.o
+    # Local symbols go, as Adium's purple-presage build does; the exports libpurple looks up stay.
+    /usr/bin/strip -x plugin/libmatrix.so
     if [[ -n "{{adium}}" ]]; then
         # The linker's own signature is what Xcode's copy phase strips; an ad-hoc one survives it
         # (Adium's Utilities/verify-purple-plugins.sh checks for exactly that).
