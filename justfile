@@ -1,12 +1,23 @@
 # purple-matrix-rs: a libpurple protocol plugin for Matrix on the matrix-rust-sdk.
+# Copyright (C) 2026 the purple-matrix-rs authors
+#
+# This program is free software; you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation; either version 2 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+# even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License in the file LICENSE for more details.
+
+# purple-matrix-rs: a libpurple protocol plugin for Matrix on the matrix-rust-sdk.
 # The Rust half is a static library under the gate; the C half in c/ is linked
 # into the loadable plugin by `just plugin`, against the libpurple of the client
 # it is built for.
 #
 # Needs: a stable Rust toolchain, just, clang, and for `check` cargo-deny and
 # cargo-machete. Three more are used when installed and skipped when not, so a
-# clone outside Tim's fleet works as it is: chronic (moreutils) keeps a green
-# gate silent, medic and bumper are the fleet's repository and release checks.
+# clone anywhere works as it is: chronic (moreutils) keeps a green
+# gate silent, medic and bumper are the maintainer's repository and release checks.
 
 chronic := `command -v chronic >/dev/null 2>&1 && echo chronic || true`
 medic := `command -v medic || true`
@@ -65,6 +76,13 @@ plugin: build
         -framework Security -framework CoreFoundation -framework SystemConfiguration \
         -lsqlite3 -liconv -lresolv -lc++
     rm -f plugin/prpl.o
+    # Local symbols go, as Adium's purple-presage build does; the exports libpurple looks up stay.
+    /usr/bin/strip -x plugin/libmatrix.so
+    if [[ -n "{{adium}}" ]]; then
+        # The linker's own signature is what Xcode's copy phase strips; an ad-hoc one survives it
+        # (Adium's Utilities/verify-purple-plugins.sh checks for exactly that).
+        codesign -f -s - plugin/libmatrix.so
+    fi
     echo "plugin/libmatrix.so: $(du -h plugin/libmatrix.so | cut -f1)"
 
 [doc("Delete the build output — run before every push")]

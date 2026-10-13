@@ -11,8 +11,12 @@ today is the Rust SDK's.
 
 ## Status
 
-A skeleton. The protocol registers, the Rust side builds an SDK client with its SQLite stores, and
-that is where it stops. What it will do, in which order, is in [SPEC.md](SPEC.md).
+Stage one is built. An account signs in with an access token in the password field (the option
+"The password is an access token" says so). Joined rooms open as chats with their members, names,
+topics and history; text goes both ways, end-to-end encrypted where the room is; invitations are
+accepted or declined; closing a window keeps the account in the room, `/leave` leaves it, and a
+bookmark or a reconnect brings a room back. Password and SSO sign-in, device verification and key
+backup come later. What is decided, and why, is in [SPEC.md](SPEC.md).
 
 ## Shape
 
@@ -35,9 +39,19 @@ headers and libraries of the client to build for.
     just plugin                                  # against pkg-config's libpurple
     ADIUM=~/path/to/adium just plugin            # against Adium's bundled frameworks
 
-`check` also runs the fleet tools `medic` and `bumper` where they are installed, and keeps a green
+`check` also runs the maintainer's `medic` and `bumper` where they are installed, and keeps a green
 run silent with `chronic` where that is; none of the three is needed.
+
+## Running
+
+The SDK's stores under `<purple user dir>/matrix/<account>/` are the device's encryption identity,
+bound to the access token's device id. Never delete them while keeping the token: other clients
+then still share room keys with the old identity, and the new store cannot read them. A fresh
+start is a new login with a new device id, that is, a new token.
 
 ## Licence
 
-GPL-2.0-or-later, as libpurple itself; the SDK is Apache-2.0.
+GPL-2.0-or-later, as libpurple itself; every source file carries the header, the text is in
+[LICENSE](LICENSE). The SDK is Apache-2.0, which is incompatible with GPLv2 and compatible with
+GPLv3, so a built `libmatrix.so`, which contains the SDK, is distributed under GPLv3; the source
+itself stays usable under version 2 or, at your option, any later version.

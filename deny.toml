@@ -14,11 +14,9 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# The fleet's own crates: this workspace's (publish = false) and the
-# orbitstack registry's.
+# The workspace's own crate (publish = false) needs no licence check.
 [licenses.private]
 ignore = true
-registries = ["orbitstack"]
 
 [bans]
 multiple-versions = "warn"
@@ -30,5 +28,4 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = [
     "https://github.com/rust-lang/crates.io-index",
-    "sparse+https://forge.orbitstack.casa/api/packages/totlik/cargo/",
 ]
