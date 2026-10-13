@@ -1,6 +1,6 @@
 [package]
 name = "purple-matrix-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 license = "GPL-2.0-or-later"
@@ -8,7 +8,7 @@ description = "A libpurple protocol plugin for Matrix on the matrix-rust-sdk, en
 repository = "https://github.com/iilonmasc/purple-matrix-rs"
 
 [package.metadata.purple-matrix-rs]
-version-date = "2026-10-13"
+version-date = "2026-10-14"
 
 [lib]
 crate-type = ["staticlib"]
