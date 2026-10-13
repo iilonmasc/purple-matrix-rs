@@ -1590,24 +1590,34 @@ mod tests {
 
     mod dev_server {
         //! The sync loop against a real Synapse, switched on by the environment and skipped with
-        //! a message without it (the message shows only under `--nocapture`: the harness swallows the
-        //! output of a passing test). The server is the dev server with the user `bob`, whose rooms
-        //! `#encrypted:localhost` and `#unencrypted:localhost` (no topic; bob and admin
-        //! are members, others may be) this test asserts as they stand; it leaves them as it found them, bar one line
-        //! it sends as bob into the unencrypted room to see it arrive live, once; the send test adds one line per room, sent through the plugin. bob's account
-        //! may be in use elsewhere while the test runs, so other rooms' events are let through.
+        //! a message without it (the message shows only under `--nocapture`: the harness
+        //! swallows the output of a passing test). The server is the dev server with the user
+        //! `bob`, whose rooms `#encrypted:localhost` and `#unencrypted:localhost` (no topic;
+        //! bob and admin are members, others may be) the tests assert as they stand. They leave
+        //! the rooms as they found them, bar one line the rooms test sends as bob into the
+        //! unencrypted room to see it arrive live, and one line per room the send test sends
+        //! through the plugin. bob's account may be in use elsewhere while the tests run, so
+        //! other rooms' events are let through.
         //!
         //! ```sh
         //! PURPLE_MATRIX_TEST_HOMESERVER=http://localhost:13622 \
         //! PURPLE_MATRIX_TEST_TOKEN=<access token of bob> \
+        //! PURPLE_MATRIX_TEST_STORE=/absolute/path/to/a/store \
         //! cargo test dev_server -- --nocapture
         //! ```
         //!
-        //! `PURPLE_MATRIX_TEST_HOMESERVER` is the URL of the homeserver and
-        //! `PURPLE_MATRIX_TEST_TOKEN` an access token of a test user on it.
+        //! `PURPLE_MATRIX_TEST_HOMESERVER` is the URL of the homeserver,
+        //! `PURPLE_MATRIX_TEST_TOKEN` an access token of a test user on it and
+        //! `PURPLE_MATRIX_TEST_STORE` an absolute path of the directory for the client's stores.
         //!
-        //! The token stays in the environment and the client's memory: it is written to no file,
-        //! and the SQLite stores go under a temp dir that is removed at the end.
+        //! The token must belong to a device no other client uses: the SDK's crypto store is
+        //! that device's identity, and a second store for the same device overwrites its keys
+        //! on the server.
+        //!
+        //! The store directory is created if missing and never removed, so every run is the
+        //! same device with the same keys. Both tests use it, one at a time (a `Mutex`): two
+        //! clients on one SQLite crypto store at once would damage it. The token stays in the
+        //! environment and the client's memory and is written to no file.
 
         use std::collections::HashSet;
         use std::sync::mpsc;
@@ -1621,15 +1631,36 @@ mod tests {
         const ENCRYPTED: &str = "!heVtGY7Bur-1MiZibul_OfNzEnYeHI9uXStT3asayDA";
         const UNENCRYPTED: &str = "!xIo6dn_Zx7l1B8qE9VyhE2QRu9h0QoMpgT7UrsOoERg";
 
-        fn settings() -> Option<(String, String)> {
+        /// One client at a time on the persistent store; held for the whole test.
+        static STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        type Settings = (
+            String,
+            String,
+            std::path::PathBuf,
+            std::sync::MutexGuard<'static, ()>,
+        );
+
+        fn settings() -> Option<Settings> {
             match (
                 std::env::var("PURPLE_MATRIX_TEST_HOMESERVER"),
                 std::env::var("PURPLE_MATRIX_TEST_TOKEN"),
+                std::env::var("PURPLE_MATRIX_TEST_STORE"),
             ) {
-                (Ok(homeserver), Ok(token)) => Some((homeserver, token)),
+                (Ok(homeserver), Ok(token), Ok(store)) => {
+                    let store = std::path::PathBuf::from(store);
+                    assert!(
+                        store.is_absolute(),
+                        "PURPLE_MATRIX_TEST_STORE must be absolute"
+                    );
+                    std::fs::create_dir_all(&store).expect("the store directory");
+                    // A failed test poisons the lock; the store is still fine for the next.
+                    let guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
+                    Some((homeserver, token, store, guard))
+                }
                 _ => {
                     eprintln!(
-                        "skipped: PURPLE_MATRIX_TEST_HOMESERVER and PURPLE_MATRIX_TEST_TOKEN are not set"
+                        "skipped: PURPLE_MATRIX_TEST_HOMESERVER, PURPLE_MATRIX_TEST_TOKEN and PURPLE_MATRIX_TEST_STORE are not all set"
                     );
                     None
                 }
@@ -1801,14 +1832,9 @@ mod tests {
         #[test]
         fn a_sent_line_comes_back_once_as_the_echo_and_is_encrypted_on_the_wire_where_the_room_is()
         {
-            let Some((homeserver, token)) = settings() else {
+            let Some((homeserver, token, dir, _store)) = settings() else {
                 return;
             };
-            let dir = std::env::temp_dir().join(format!(
-                "purple-matrix-rs-dev-server-send-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
             let (account, woken) = account();
             account.login(&homeserver, &dir.to_string_lossy(), &token);
             let mut seen = collect_until(
@@ -1870,19 +1896,13 @@ mod tests {
             assert_eq!(distinct.len(), ids.len(), "a line shown twice: {ids:?}");
 
             account.close();
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
         fn the_rooms_open_with_their_members_and_a_line_sent_live_shows_once() {
-            let Some((homeserver, token)) = settings() else {
+            let Some((homeserver, token, dir, _store)) = settings() else {
                 return;
             };
-            let dir = std::env::temp_dir().join(format!(
-                "purple-matrix-rs-dev-server-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
             let (account, woken) = account();
             account.login(&homeserver, &dir.to_string_lossy(), &token);
 
@@ -1950,7 +1970,6 @@ mod tests {
             assert_eq!(shown.iter().filter(|id| **id == event_id).count(), 1);
 
             account.close();
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
