@@ -18,32 +18,113 @@ use matrix_sdk::Client;
 use tokio::sync::mpsc;
 
 use crate::login::{ErrorReason, sign_in};
+use crate::rooms;
 
 /// What libpurple asks of the account.
-enum Command {
+pub(crate) enum Command {
     Login {
         homeserver: String,
         store_dir: String,
         token: String,
     },
+    /// Join the room, or accept the invitation to it; the chat opens with the next sync.
+    Join {
+        room_id: String,
+    },
+    /// Decline the invitation to the room.
+    Reject {
+        room_id: String,
+    },
     Shutdown,
 }
 
-/// What the account tells libpurple.
+/// A room member as the chat lists them: the user id, and the name the member goes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub user_id: String,
+    pub name: String,
+}
+
+/// What the account tells libpurple. Timestamps are seconds since the epoch, the event's own.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     /// The token is good; the account is signed in as `user_id`.
-    Connected { user_id: String },
+    Connected {
+        user_id: String,
+    },
     /// The connection failed, with libpurple's reason and the message to show.
     Error {
         reason: ErrorReason,
+        message: String,
+    },
+    /// A room the account is in: the chat opens with these members, this name and topic.
+    RoomJoined {
+        room_id: String,
+        name: String,
+        topic: Option<String>,
+        members: Vec<Member>,
+    },
+    /// The account is no longer in the room; the chat is over.
+    RoomLeft {
+        room_id: String,
+    },
+    MemberJoined {
+        room_id: String,
+        member: Member,
+    },
+    /// A member changed display name: `old_name` in the chat becomes `name`.
+    MemberRenamed {
+        room_id: String,
+        old_name: String,
+        name: String,
+    },
+    MemberLeft {
+        room_id: String,
+        name: String,
+    },
+    RoomNamed {
+        room_id: String,
+        name: String,
+    },
+    RoomTopic {
+        room_id: String,
+        who: String,
+        topic: String,
+    },
+    /// A line in the chat, history or live; `event_id` tells the server's echo of an own message
+    /// from a new one.
+    Message {
+        room_id: String,
+        event_id: String,
+        sender: String,
+        body: String,
+        timestamp: i64,
+    },
+    /// A line from the plugin itself in the chat, such as a message that could not be decrypted.
+    Notice {
+        room_id: String,
+        body: String,
+        timestamp: i64,
+    },
+    /// An invitation to the room, from `inviter`.
+    Invited {
+        room_id: String,
+        name: String,
+        inviter: String,
+    },
+    JoinFailed {
+        room_id: String,
+        message: String,
+    },
+    LeaveFailed {
+        room_id: String,
         message: String,
     },
 }
 
 /// The main-thread path out: events queue here, and the wake callback is called once per batch —
 /// when an event lands in an empty queue — until [`Outbox::pop`] has emptied it again.
-struct Outbox {
+pub(crate) struct Outbox {
     queue: Mutex<Queue>,
     wake: Box<dyn Fn() + Send + Sync>,
 }
@@ -54,7 +135,17 @@ struct Queue {
 }
 
 impl Outbox {
-    fn push(&self, event: Event) {
+    pub(crate) fn new(wake: Box<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            queue: Mutex::new(Queue {
+                events: VecDeque::new(),
+                wake_pending: false,
+            }),
+            wake,
+        }
+    }
+
+    pub(crate) fn push(&self, event: Event) {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         queue.events.push_back(event);
         let wake = !queue.wake_pending;
@@ -65,7 +156,7 @@ impl Outbox {
         }
     }
 
-    fn pop(&self) -> Option<Event> {
+    pub(crate) fn pop(&self) -> Option<Event> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         let event = queue.events.pop_front();
         if event.is_none() {
@@ -87,13 +178,7 @@ impl Account {
     /// batch is ready; it must schedule [`Account::next_event`] on the main thread and nothing more.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
         let (commands, inbox) = mpsc::unbounded_channel();
-        let outbox = Arc::new(Outbox {
-            queue: Mutex::new(Queue {
-                events: VecDeque::new(),
-                wake_pending: false,
-            }),
-            wake: Box::new(wake),
-        });
+        let outbox = Arc::new(Outbox::new(Box::new(wake)));
         let thread_outbox = Arc::clone(&outbox);
         let thread = std::thread::Builder::new()
             .name("matrix-account".into())
@@ -113,6 +198,21 @@ impl Account {
             homeserver: homeserver.to_owned(),
             store_dir: store_dir.to_owned(),
             token: token.to_owned(),
+        });
+    }
+
+    /// Join the room, or accept the invitation to it; the chat opens as an [`Event::RoomJoined`]
+    /// with the next sync, or an [`Event::JoinFailed`] says why not.
+    pub fn join(&self, room_id: &str) {
+        let _ = self.commands.send(Command::Join {
+            room_id: room_id.to_owned(),
+        });
+    }
+
+    /// Decline the invitation to the room; an [`Event::LeaveFailed`] says if that did not work.
+    pub fn reject(&self, room_id: &str) {
+        let _ = self.commands.send(Command::Reject {
+            room_id: room_id.to_owned(),
         });
     }
 
@@ -148,12 +248,15 @@ fn refuse(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>, e: s
                 reason: ErrorReason::Other,
                 message: format!("no runtime for the account: {e}"),
             }),
+            Command::Join { .. } | Command::Reject { .. } => {}
             Command::Shutdown => return,
         }
     }
 }
 
-/// The command loop; the client lives here, and is dropped here when the loop ends.
+/// The command loop; the client lives here, and is dropped here when the loop ends. A signed-in
+/// client hands the loop to [`rooms::serve`], which syncs and carries out the commands until the
+/// shutdown or until the sync fails for good.
 async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
     let mut client: Option<Client> = None;
     'commands: while let Some(command) = inbox.recv().await {
@@ -187,10 +290,20 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
                                 reason: ErrorReason::Other,
                                 message: "a sign-in is already under way".to_owned(),
                             }),
+                            // Nothing to join before the account is signed in.
+                            Some(Command::Join { .. } | Command::Reject { .. }) => {}
                         },
                     }
                 }
+                if let Some(signed_in) = &client
+                    && let rooms::Stopped::Shutdown =
+                        rooms::serve(signed_in, &mut inbox, &outbox).await
+                {
+                    break 'commands;
+                }
             }
+            // After a sync failed for good there is no room to join; libpurple's close follows.
+            Command::Join { .. } | Command::Reject { .. } => {}
             Command::Shutdown => break,
         }
     }
@@ -416,15 +529,9 @@ mod tests {
     #[test]
     fn the_outbox_wakes_once_per_batch() {
         let (tx, rx) = mpsc::channel();
-        let outbox = Outbox {
-            queue: Mutex::new(Queue {
-                events: VecDeque::new(),
-                wake_pending: false,
-            }),
-            wake: Box::new(move || {
-                let _ = tx.send(());
-            }),
-        };
+        let outbox = Outbox::new(Box::new(move || {
+            let _ = tx.send(());
+        }));
         let event = || Event::Connected {
             user_id: "@a:b".to_owned(),
         };
