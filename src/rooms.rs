@@ -1845,8 +1845,8 @@ mod tests {
         //! The sync loop against a real Synapse, switched on by the environment and skipped with
         //! a message without it (the message shows only under `--nocapture`: the harness
         //! swallows the output of a passing test). The server is the dev server with the user
-        //! `bob`, whose rooms `#encrypted:localhost` and `#unencrypted:localhost` (no topic;
-        //! bob and admin are members, others may be) the tests assert as they stand. They leave
+        //! `bob`, whose rooms `#encrypted:localhost` and `#unencrypted:localhost` (any
+        //! topic; bob and admin are members, others may be) the tests assert as they stand. They leave
         //! the rooms as they found them, bar one line the rooms test sends as bob into the
         //! unencrypted room to see it arrive live, and one line per room the send test sends
         //! through the plugin. bob's account may be in use elsewhere while the tests run, so
@@ -1996,13 +1996,15 @@ mod tests {
             ]
         }
 
-        /// A chat's members cut down to the ones `members()` names, in the order of `members()`.
+        /// A chat's members cut down to the ones `members()` names, in the order of `members()`,
+        /// and its topic normalised to `None`: the topic is the one field a hand test on the dev
+        /// server may change, and these tests name only what they must.
         fn named_members(event: &Event) -> Option<Event> {
             let Event::RoomJoined {
                 room_id,
                 name,
-                topic,
                 members: all,
+                ..
             } = event
             else {
                 return None;
@@ -2019,7 +2021,7 @@ mod tests {
             Some(Event::RoomJoined {
                 room_id: room_id.clone(),
                 name: name.clone(),
-                topic: topic.clone(),
+                topic: None,
                 members: named,
             })
         }
