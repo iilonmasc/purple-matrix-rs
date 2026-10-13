@@ -39,6 +39,7 @@ pub const EVENT_NOTICE: c_int = 11;
 pub const EVENT_INVITED: c_int = 12;
 pub const EVENT_JOIN_FAILED: c_int = 13;
 pub const EVENT_LEAVE_FAILED: c_int = 14;
+pub const EVENT_SEND_FAILED: c_int = 15;
 
 /// An [`Event`] for the C side: one struct for every kind, so a new kind is a new `kind` value
 /// and the fields it fills, not a new function. Strings are null where the kind has no value for
@@ -59,6 +60,7 @@ pub const EVENT_LEAVE_FAILED: c_int = 14;
 /// | `NOTICE` | `room_id`, `text`, `timestamp` |
 /// | `INVITED` | `room_id`, `text` the room's name, `name` the inviter |
 /// | `JOIN_FAILED`, `LEAVE_FAILED` | `room_id`, `text` the message |
+/// | `SEND_FAILED` | `room_id`, `name` the unsent text, `text` the message |
 #[repr(C)]
 pub struct CEvent {
     pub kind: c_int,
@@ -219,6 +221,16 @@ impl From<Event> for CEvent {
                 text: into_c(message),
                 ..Self::empty(EVENT_LEAVE_FAILED)
             },
+            Event::SendFailed {
+                room_id,
+                text,
+                message,
+            } => Self {
+                room_id: into_c(room_id),
+                name: into_c(text),
+                text: into_c(message),
+                ..Self::empty(EVENT_SEND_FAILED)
+            },
         }
     }
 }
@@ -354,6 +366,26 @@ pub unsafe extern "C" fn purple_matrix_account_join(account: *mut Account, room_
     }
     let room_id = unsafe { from_c(room_id) };
     unsafe { &*account }.join(&room_id);
+}
+
+/// Send `body`, plain text, into the room with `room_id`. The line shows when the server's echo
+/// arrives as a `MESSAGE`; a failure is a `SEND_FAILED`.
+///
+/// # Safety
+/// `account` must come from `purple_matrix_account_new` and not be closed; `room_id` and `body`
+/// must be NUL-terminated and outlive the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn purple_matrix_account_send(
+    account: *mut Account,
+    room_id: *const c_char,
+    body: *const c_char,
+) {
+    if account.is_null() {
+        return;
+    }
+    let room_id = unsafe { from_c(room_id) };
+    let body = unsafe { from_c(body) };
+    unsafe { &*account }.send(&room_id, &body);
 }
 
 /// Decline the invitation to the room with `room_id`.
@@ -503,6 +535,29 @@ mod tests {
             ]
         );
         drop(event);
+    }
+
+    #[test]
+    fn a_failed_send_crosses_with_the_unsent_text_and_the_reason() {
+        let event = CEvent::from(Event::SendFailed {
+            room_id: "!r:localhost".to_owned(),
+            text: "hello".to_owned(),
+            message: "no".to_owned(),
+        });
+        assert_eq!(
+            (
+                event.kind,
+                c_str(event.room_id),
+                c_str(event.name),
+                c_str(event.text)
+            ),
+            (
+                EVENT_SEND_FAILED,
+                Some("!r:localhost".to_owned()),
+                Some("hello".to_owned()),
+                Some("no".to_owned())
+            )
+        );
     }
 
     #[test]

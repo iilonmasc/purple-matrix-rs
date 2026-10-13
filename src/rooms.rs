@@ -18,6 +18,7 @@ use matrix_sdk::config::SyncSettings;
 use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::member::MembershipState;
+use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
     SyncStateEvent,
@@ -141,6 +142,12 @@ pub async fn serve(
                     }
                     Some(Command::Reject { room_id }) => {
                         let work = rooms.reject(client, &room_id, outbox);
+                        if inbox.until_shutdown(work).await.is_none() {
+                            return Stopped::Shutdown;
+                        }
+                    }
+                    Some(Command::Send { room_id, body }) => {
+                        let work = rooms.send(client, &room_id, body, outbox);
                         if inbox.until_shutdown(work).await.is_none() {
                             return Stopped::Shutdown;
                         }
@@ -293,6 +300,31 @@ impl Rooms {
         };
         if let Err(e) = client.join_room_by_id(&id).await {
             outbox.push(failed(e.to_string()));
+        }
+    }
+
+    /// Send a text message into a joined room. The SDK encrypts it where the room is encrypted
+    /// and shares the room key with the members' devices first. Nothing is shown here: the
+    /// line is the server's echo, which the next sync delivers through [`Chat::show`].
+    async fn send(&self, client: &Client, room_id: &str, body: String, outbox: &Outbox) {
+        let failed = |message: String, text: String| Event::SendFailed {
+            room_id: room_id.to_owned(),
+            text,
+            message,
+        };
+        let room = RoomId::parse(room_id)
+            .ok()
+            .and_then(|id| client.get_room(&id))
+            .filter(|room| room.state() == RoomState::Joined);
+        let Some(room) = room else {
+            outbox.push(failed("the room is not joined".to_owned(), body));
+            return;
+        };
+        if let Err(e) = room
+            .send(RoomMessageEventContent::text_plain(body.clone()))
+            .await
+        {
+            outbox.push(failed(e.to_string(), body));
         }
     }
 
@@ -532,6 +564,15 @@ impl Happening {
     }
 }
 
+/// The text of a message as a chat line: an emote reads as "/me …", which libpurple renders as
+/// an action; text and notice are their body.
+fn line_of(msgtype: &MessageType) -> String {
+    match msgtype {
+        MessageType::Emote(emote) => format!("/me {}", emote.body),
+        other => other.body().to_owned(),
+    }
+}
+
 /// Read a timeline event, decrypted by the SDK where it could; `None` for an event the chat
 /// does not show.
 fn interpret(event: &TimelineEvent) -> Option<Happening> {
@@ -552,7 +593,7 @@ fn interpret(event: &TimelineEvent) -> Option<Happening> {
         )) => Some(Happening::Message {
             event_id: message.event_id,
             sender: message.sender,
-            body: message.content.body().to_owned(),
+            body: line_of(&message.content.msgtype),
             timestamp,
         }),
         AnySyncTimelineEvent::State(AnySyncStateEvent::RoomMember(SyncStateEvent::Original(
@@ -587,6 +628,25 @@ mod tests {
 
     fn plaintext(json: serde_json::Value) -> TimelineEvent {
         TimelineEvent::from_plaintext(Raw::from_json_string(json.to_string()).expect("valid json"))
+    }
+
+    #[test]
+    fn an_emote_reads_as_me_and_a_notice_as_its_body() {
+        let line = |msgtype: &str, body: &str| {
+            interpret(&plaintext(json!({
+                "type": "m.room.message",
+                "event_id": "$m1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_700_000_000_000u64,
+                "content": {"msgtype": msgtype, "body": body}
+            })))
+            .map(|happening| match happening {
+                Happening::Message { body, .. } => body,
+                other => panic!("{other:?}"),
+            })
+        };
+        assert_eq!(line("m.emote", "waves"), Some("/me waves".to_owned()));
+        assert_eq!(line("m.notice", "deployed"), Some("deployed".to_owned()));
     }
 
     #[test]
@@ -859,6 +919,8 @@ mod tests {
 
         struct State {
             seen: Vec<String>,
+            /// The sends, as the homeserver got them: the request line and the JSON body.
+            sent: Vec<(String, Value)>,
             script: Vec<Scripted>,
             next: usize,
         }
@@ -874,6 +936,7 @@ mod tests {
                 let port = listener.local_addr().expect("the bound address").port();
                 let state = Arc::new(Mutex::new(State {
                     seen: Vec::new(),
+                    sent: Vec::new(),
                     script,
                     next: 0,
                 }));
@@ -895,6 +958,14 @@ mod tests {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .seen
+                    .clone()
+            }
+
+            fn sent(&self) -> Vec<(String, Value)> {
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .sent
                     .clone()
             }
 
@@ -934,13 +1005,33 @@ mod tests {
                 .unwrap_or_default();
             let mut body = vec![0u8; content_length];
             let _ = stream.read_exact(&mut body);
-            state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .seen
-                .push(format!("{method} {target}"));
+            let sent_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            {
+                let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.seen.push(format!("{method} {target}"));
+                if method == "PUT" {
+                    state
+                        .sent
+                        .push((format!("{method} {target}"), sent_body.clone()));
+                }
+            }
 
             let (status, body) = match (method, target) {
+                // A send first asks whether the room is encrypted; this room has no such state.
+                ("GET", t) if t.contains("/state/m.room.encryption") => (
+                    "404 Not Found",
+                    json!({"errcode": "M_NOT_FOUND", "error": "Event not found."}),
+                ),
+                ("PUT", t) if t.contains("/send/m.room.message/") => {
+                    if sent_body["body"] == "forbidden" {
+                        (
+                            "403 Forbidden",
+                            json!({"errcode": "M_FORBIDDEN", "error": "You are not allowed to post here"}),
+                        )
+                    } else {
+                        ("200 OK", json!({"event_id": "$echo:localhost"}))
+                    }
+                }
                 ("GET", "/_matrix/client/v3/account/whoami") => (
                     "200 OK",
                     json!({"user_id": "@probe:localhost", "device_id": "PROBEDEVICE", "is_guest": false}),
@@ -1261,6 +1352,95 @@ mod tests {
         }
 
         #[test]
+        fn a_sent_message_reaches_the_server_as_plain_text_and_shows_once_as_the_servers_echo() {
+            let homeserver = Homeserver::start(vec![
+                Scripted {
+                    gate: None,
+                    body: json!({"next_batch": "s1", "rooms": {"join": {GENERAL: {
+                        "state": {"events": [
+                            state_event("m.room.create", "@alice:localhost", json!({"creator": "@alice:localhost", "room_version": "10"})),
+                            member(GENERAL, "@alice:localhost", "join", Some("Alice")),
+                            member(GENERAL, "@probe:localhost", "join", Some("Probe")),
+                        ]},
+                        "timeline": {"events": [], "limited": false, "prev_batch": "p1"}
+                    }}}}),
+                },
+                // The echo comes only once the send has reached the homeserver.
+                Scripted {
+                    gate: Some("/send/m.room.message/"),
+                    body: json!({"next_batch": "s2", "rooms": {"join": {GENERAL: {
+                        "timeline": {"events": [
+                            message("$echo:localhost", "@probe:localhost", "hello & <b>", 1_700_000_400_000u64),
+                        ], "limited": false}
+                    }}}}),
+                },
+            ]);
+            let dir = std::env::temp_dir().join(format!(
+                "purple-matrix-rs-loopback-send-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (account, woken) = account();
+            account.login(
+                &homeserver.url,
+                &dir.to_string_lossy(),
+                "syt_loopback_token",
+            );
+            // Connected, the room, and the two history lines.
+            let opened = collect(&homeserver, &account, &woken, 4);
+            assert_eq!(opened.len(), 4, "{opened:?}");
+
+            account.send(GENERAL, "hello & <b>");
+            let echo = collect(&homeserver, &account, &woken, 1);
+            assert_eq!(
+                echo,
+                vec![Event::Message {
+                    room_id: room(GENERAL),
+                    event_id: "$echo:localhost".to_owned(),
+                    sender: "Probe".to_owned(),
+                    body: "hello & <b>".to_owned(),
+                    timestamp: 1_700_000_400,
+                }]
+            );
+            let sent = homeserver.sent();
+            assert_eq!(sent.len(), 1);
+            // The transaction id varies from run to run; the rest of the request line is fixed.
+            assert!(
+                sent[0].0.starts_with(
+                    "PUT /_matrix/client/v3/rooms/!general:localhost/send/m.room.message/"
+                ),
+                "{}",
+                sent[0].0
+            );
+            assert_eq!(
+                sent[0].1,
+                json!({"msgtype": "m.text", "body": "hello & <b>"})
+            );
+
+            // A refusal by the homeserver, and a room the account is not in, are send failures.
+            account.send(GENERAL, "forbidden");
+            account.send("!elsewhere:localhost", "lost");
+            let failures = collect(&homeserver, &account, &woken, 2);
+            assert_eq!(
+                failures,
+                vec![
+                    Event::SendFailed {
+                        room_id: room(GENERAL),
+                        text: "forbidden".to_owned(),
+                        message: "the server returned an error: [403 / M_FORBIDDEN] You are not allowed to post here".to_owned(),
+                    },
+                    Event::SendFailed {
+                        room_id: "!elsewhere:localhost".to_owned(),
+                        text: "lost".to_owned(),
+                        message: "the room is not joined".to_owned(),
+                    },
+                ]
+            );
+            account.close();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn joined_rooms_open_with_history_once_invites_arrive_and_join_and_decline_reach_the_server()
          {
             let homeserver = Homeserver::start(script());
@@ -1414,7 +1594,7 @@ mod tests {
         //! output of a passing test). The server is the dev server with the user `bob`, whose rooms
         //! `#encrypted:localhost` and `#unencrypted:localhost` (no topic; bob and admin
         //! are members, others may be) this test asserts as they stand; it leaves them as it found them, bar one line
-        //! it sends as bob into the unencrypted room to see it arrive live, once. bob's account
+        //! it sends as bob into the unencrypted room to see it arrive live, once; the send test adds one line per room, sent through the plugin. bob's account
         //! may be in use elsewhere while the test runs, so other rooms' events are let through.
         //!
         //! ```sh
@@ -1502,7 +1682,8 @@ mod tests {
                 | Event::Notice { room_id, .. }
                 | Event::Invited { room_id, .. }
                 | Event::JoinFailed { room_id, .. }
-                | Event::LeaveFailed { room_id, .. } => room_id,
+                | Event::LeaveFailed { room_id, .. }
+                | Event::SendFailed { room_id, .. } => room_id,
             };
             rooms.contains(&room_id.as_str())
         }
@@ -1596,6 +1777,100 @@ mod tests {
                 let ts = event["origin_server_ts"].as_i64().expect("a timestamp") / 1000;
                 (event_id, ts)
             })
+        }
+
+        /// The event as the homeserver holds it, undecrypted: `GET .../event/<id>`.
+        fn raw_event(homeserver: &str, token: &str, room_id: &str, event_id: &str) -> Value {
+            let runtime = tokio::runtime::Runtime::new().expect("a runtime for the API calls");
+            runtime.block_on(async {
+                let bytes = matrix_sdk::reqwest::Client::new()
+                    .get(format!(
+                        "{homeserver}/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+                    ))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .expect("the event request")
+                    .bytes()
+                    .await
+                    .expect("the event");
+                serde_json::from_slice(&bytes).expect("json")
+            })
+        }
+
+        #[test]
+        fn a_sent_line_comes_back_once_as_the_echo_and_is_encrypted_on_the_wire_where_the_room_is()
+        {
+            let Some((homeserver, token)) = settings() else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!(
+                "purple-matrix-rs-dev-server-send-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (account, woken) = account();
+            account.login(&homeserver, &dir.to_string_lossy(), &token);
+            let mut seen = collect_until(
+                &account,
+                &woken,
+                |e| matches!(e, Event::RoomJoined { room_id, .. } if room_id == UNENCRYPTED),
+            );
+            if !seen
+                .iter()
+                .any(|e| matches!(e, Event::RoomJoined { room_id, .. } if room_id == ENCRYPTED))
+            {
+                seen.extend(collect_until(
+                    &account,
+                    &woken,
+                    |e| matches!(e, Event::RoomJoined { room_id, .. } if room_id == ENCRYPTED),
+                ));
+            }
+
+            for (room_id, wire_type) in [
+                (UNENCRYPTED, "m.room.message"),
+                (ENCRYPTED, "m.room.encrypted"),
+            ] {
+                let body = format!(
+                    "purple-matrix-rs send test {} {wire_type}",
+                    std::process::id()
+                );
+                account.send(room_id, &body);
+                let is_echo = |e: &Event| matches!(e, Event::Message { body: b, .. } if *b == body);
+                let events = collect_until(&account, &woken, is_echo);
+                let echoes: Vec<&Event> = events.iter().filter(|e| is_echo(e)).collect();
+                assert_eq!(echoes.len(), 1, "{events:?}");
+                let Event::Message {
+                    room_id: echoed_in,
+                    event_id,
+                    sender,
+                    ..
+                } = echoes[0]
+                else {
+                    panic!("{:?}", echoes[0]);
+                };
+                // The echo is bob's own line, in the room it was sent to.
+                assert_eq!((echoed_in.as_str(), sender.as_str()), (room_id, "Bob"));
+
+                // On the wire the line is what the room demands: the SDK encrypted it without
+                // being asked, and the body is nowhere in the event the server holds.
+                let raw = raw_event(&homeserver, &token, room_id, event_id);
+                assert_eq!(raw["type"], wire_type, "{raw}");
+                assert_eq!(raw["sender"], "@bob:localhost");
+                if wire_type == "m.room.encrypted" {
+                    assert!(raw["content"].get("body").is_none(), "{raw}");
+                    assert_eq!(raw["content"]["algorithm"], "m.megolm.v1.aes-sha2");
+                } else {
+                    assert_eq!(raw["content"]["body"], body.as_str());
+                }
+                seen.extend(events);
+            }
+            let ids = line_ids(&seen);
+            let distinct: HashSet<&String> = ids.iter().collect();
+            assert_eq!(distinct.len(), ids.len(), "a line shown twice: {ids:?}");
+
+            account.close();
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]

@@ -35,6 +35,12 @@ pub(crate) enum Command {
     Reject {
         room_id: String,
     },
+    /// Send `body` as a text message into the room; the line appears when the sync delivers the
+    /// event, never at send time.
+    Send {
+        room_id: String,
+        body: String,
+    },
     Shutdown,
 }
 
@@ -118,6 +124,12 @@ pub enum Event {
     },
     LeaveFailed {
         room_id: String,
+        message: String,
+    },
+    /// A message could not be sent: `text` is what was typed, `message` the reason.
+    SendFailed {
+        room_id: String,
+        text: String,
         message: String,
     },
 }
@@ -216,6 +228,15 @@ impl Account {
         });
     }
 
+    /// Send `body` as a text message into the room. Nothing comes back on success but the
+    /// server's echo, an [`Event::Message`] with the next sync; an [`Event::SendFailed`] says why not.
+    pub fn send(&self, room_id: &str, body: &str) {
+        let _ = self.commands.send(Command::Send {
+            room_id: room_id.to_owned(),
+            body: body.to_owned(),
+        });
+    }
+
     /// The next event for libpurple, on the main thread; `None` once the batch is collected.
     pub fn next_event(&self) -> Option<Event> {
         self.outbox.pop()
@@ -248,7 +269,7 @@ fn refuse(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>, e: s
                 reason: ErrorReason::Other,
                 message: format!("no runtime for the account: {e}"),
             }),
-            Command::Join { .. } | Command::Reject { .. } => {}
+            Command::Join { .. } | Command::Reject { .. } | Command::Send { .. } => {}
             Command::Shutdown => return,
         }
     }
@@ -291,7 +312,7 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
                                 message: "a sign-in is already under way".to_owned(),
                             }),
                             // Nothing to join before the account is signed in.
-                            Some(Command::Join { .. } | Command::Reject { .. }) => {}
+                            Some(Command::Join { .. } | Command::Reject { .. } | Command::Send { .. }) => {}
                         },
                     }
                 }
@@ -303,7 +324,7 @@ async fn run(mut inbox: mpsc::UnboundedReceiver<Command>, outbox: Arc<Outbox>) {
                 }
             }
             // After a sync failed for good there is no room to join; libpurple's close follows.
-            Command::Join { .. } | Command::Reject { .. } => {}
+            Command::Join { .. } | Command::Reject { .. } | Command::Send { .. } => {}
             Command::Shutdown => break,
         }
     }
