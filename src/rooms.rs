@@ -52,6 +52,40 @@ pub enum Stopped {
     SyncFailed,
 }
 
+/// The command inbox, with a way to wait on a request and still hear the shutdown. Commands
+/// that arrive while a request is awaited are held and handed out first by the next `recv`.
+struct Inbox<'a> {
+    rx: &'a mut mpsc::UnboundedReceiver<Command>,
+    held: VecDeque<Command>,
+}
+
+impl Inbox<'_> {
+    /// The next command; `None` when the sender is gone. Cancel-safe, so it can sit in a `select!`.
+    async fn recv(&mut self) -> Option<Command> {
+        match self.held.pop_front() {
+            Some(command) => Some(command),
+            None => self.rx.recv().await,
+        }
+    }
+
+    /// Await `request` unless the shutdown comes first: every SDK request in the loop goes
+    /// through here, since one can take minutes (the SDK retries a members request for as long
+    /// as 60 s a try) and libpurple's close waits for the thread on its main thread. `None` is
+    /// the shutdown; the request is dropped inside the runtime.
+    async fn until_shutdown<T>(&mut self, request: impl Future<Output = T>) -> Option<T> {
+        let mut request = pin!(request);
+        loop {
+            tokio::select! {
+                done = &mut request => return Some(done),
+                next = self.rx.recv() => match next {
+                    Some(Command::Shutdown) | None => return None,
+                    Some(other) => self.held.push_back(other),
+                },
+            }
+        }
+    }
+}
+
 /// Sync until libpurple closes the account or the sync fails for good. Commands on `inbox` are
 /// carried out between and during syncs.
 pub async fn serve(
@@ -59,6 +93,10 @@ pub async fn serve(
     inbox: &mut mpsc::UnboundedReceiver<Command>,
     outbox: &Outbox,
 ) -> Stopped {
+    let mut inbox = Inbox {
+        rx: inbox,
+        held: VecDeque::new(),
+    };
     let mut rooms = Rooms::default();
     let mut failures = 0usize;
     loop {
@@ -77,7 +115,10 @@ pub async fn serve(
                     match outcome {
                         Ok(response) => {
                             failures = 0;
-                            rooms.after_sync(client, &response, outbox).await;
+                            let work = rooms.after_sync(client, &response, outbox);
+                            if inbox.until_shutdown(work).await.is_none() {
+                                return Stopped::Shutdown;
+                            }
                         }
                         Err(e) if is_network(&e) && failures < RETRY_DELAYS.len() => failures += 1,
                         Err(e) => {
@@ -92,8 +133,18 @@ pub async fn serve(
                 }
                 next = inbox.recv() => match next {
                     Some(Command::Shutdown) | None => return Stopped::Shutdown,
-                    Some(Command::Join { room_id }) => rooms.join(client, &room_id, outbox).await,
-                    Some(Command::Reject { room_id }) => rooms.reject(client, &room_id, outbox).await,
+                    Some(Command::Join { room_id }) => {
+                        let work = rooms.join(client, &room_id, outbox);
+                        if inbox.until_shutdown(work).await.is_none() {
+                            return Stopped::Shutdown;
+                        }
+                    }
+                    Some(Command::Reject { room_id }) => {
+                        let work = rooms.reject(client, &room_id, outbox);
+                        if inbox.until_shutdown(work).await.is_none() {
+                            return Stopped::Shutdown;
+                        }
+                    }
                     Some(Command::Login { .. }) => outbox.push(Event::Error {
                         reason: ErrorReason::Other,
                         message: "the account is already signed in".to_owned(),
@@ -795,6 +846,10 @@ mod tests {
         const GENERAL: &str = "!general:localhost";
         const SECRET: &str = "!secret:localhost";
         const SPAM: &str = "!spam:localhost";
+        /// A room whose members request the homeserver never answers.
+        const HANG: &str = "!hang:localhost";
+        /// An invitation whose join request the homeserver never answers.
+        const STUCK: &str = "!stuck:localhost";
 
         /// One sync response, served once the request line holding `gate` has been seen.
         struct Scripted {
@@ -903,6 +958,15 @@ mod tests {
                             return;
                         }
                     }
+                }
+                ("GET" | "POST", t)
+                    if t.contains("!hang:localhost/members")
+                        || t.contains("!stuck:localhost/join") =>
+                {
+                    // Never answered: hold the request until the client goes.
+                    let mut sink = Vec::new();
+                    let _ = stream.read_to_end(&mut sink);
+                    return;
                 }
                 ("GET", t) if t.contains("!general:localhost/messages") => (
                     "200 OK",
@@ -1120,6 +1184,82 @@ mod tests {
             room_id.to_owned()
         }
 
+        /// Wait until the homeserver has seen a request line holding `part`.
+        fn await_request(homeserver: &Homeserver, part: &str) {
+            let started = Instant::now();
+            while !homeserver.seen().iter().any(|l| l.contains(part)) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "no {part} request: {:?}",
+                    homeserver.seen()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// The close of an account whose runtime thread waits on a request the homeserver never
+        /// answers returns at once; the SDK itself would wait 60 s a try, and libpurple closes on
+        /// its main thread.
+        fn closes_quickly(account: Account) {
+            let started = Instant::now();
+            account.close();
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(10), "the close took {took:?}");
+        }
+
+        #[test]
+        fn a_close_while_the_members_of_a_room_are_awaited_returns_at_once() {
+            let homeserver = Homeserver::start(vec![Scripted {
+                gate: None,
+                body: json!({"next_batch": "s1", "rooms": {"join": {HANG: {"state": {"events": [
+                    state_event("m.room.create", "@alice:localhost", json!({"creator": "@alice:localhost", "room_version": "10"})),
+                    member(HANG, "@probe:localhost", "join", Some("Probe")),
+                ]}}}}}),
+            }]);
+            let dir = std::env::temp_dir().join(format!(
+                "purple-matrix-rs-loopback-hang-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (account, _woken) = account();
+            account.login(
+                &homeserver.url,
+                &dir.to_string_lossy(),
+                "syt_loopback_token",
+            );
+            await_request(&homeserver, "!hang:localhost/members");
+            closes_quickly(account);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_close_while_a_join_is_awaited_returns_at_once() {
+            let homeserver = Homeserver::start(vec![Scripted {
+                gate: None,
+                body: json!({"next_batch": "s1", "rooms": {"invite": {STUCK: {"invite_state": {"events": [
+                    stripped("m.room.name", "@bob:localhost", "", json!({"name": "Stuck"})),
+                    stripped("m.room.member", "@bob:localhost", "@probe:localhost", json!({"membership": "invite"})),
+                ]}}}}}),
+            }]);
+            let dir = std::env::temp_dir().join(format!(
+                "purple-matrix-rs-loopback-stuck-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (account, woken) = account();
+            account.login(
+                &homeserver.url,
+                &dir.to_string_lossy(),
+                "syt_loopback_token",
+            );
+            let events = collect(&homeserver, &account, &woken, 2);
+            assert_eq!(events.len(), 2);
+            account.join(STUCK);
+            await_request(&homeserver, "!stuck:localhost/join");
+            closes_quickly(account);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[test]
         fn joined_rooms_open_with_history_once_invites_arrive_and_join_and_decline_reach_the_server()
          {
@@ -1270,7 +1410,8 @@ mod tests {
 
     mod dev_server {
         //! The sync loop against a real Synapse, switched on by the environment and skipped with
-        //! a message without it. The server is Tim's dev server with the user `bob`, whose rooms
+        //! a message without it (the message shows only under `--nocapture`: the harness swallows the
+        //! output of a passing test). The server is the dev server with the user `bob`, whose rooms
         //! `#encrypted:localhost` and `#unencrypted:localhost` (members Admin, Bob, Tim; no
         //! topic) this test asserts as they stand; it leaves them as it found them, bar one line
         //! it sends as bob into the unencrypted room to see it arrive live, once. bob's account
@@ -1476,14 +1617,6 @@ mod tests {
                     },
                 ]
             );
-            let history = line_ids(&opened);
-            let distinct: HashSet<&String> = history.iter().collect();
-            assert_eq!(
-                distinct.len(),
-                history.len(),
-                "a history line shown twice: {history:?}"
-            );
-
             // A line sent as bob arrives live, once, as bob's own; nothing of the history comes
             // with that sync.
             let body = format!("purple-matrix-rs rooms test {}", std::process::id());
@@ -1503,14 +1636,14 @@ mod tests {
                     timestamp,
                 })
             );
-            let repeated: Vec<String> = line_ids(&live)
-                .into_iter()
-                .filter(|id| history.contains(id))
-                .collect();
-            assert_eq!(repeated, Vec::<String>::new());
-            let in_the_room: Vec<&Event> =
-                live.iter().filter(|e| about(e, &[UNENCRYPTED])).collect();
-            assert_eq!(in_the_room, vec![live.last().expect("the line")]);
+            // `open` announces a room before it fetches its history, so history lines can arrive
+            // after `RoomJoined`, in the same batches as the live line: whatever came, no line
+            // is shown twice, and the live one once.
+            let mut shown = line_ids(&opened);
+            shown.extend(line_ids(&live));
+            let distinct: HashSet<&String> = shown.iter().collect();
+            assert_eq!(distinct.len(), shown.len(), "a line shown twice: {shown:?}");
+            assert_eq!(shown.iter().filter(|id| **id == event_id).count(), 1);
 
             account.close();
             let _ = std::fs::remove_dir_all(&dir);

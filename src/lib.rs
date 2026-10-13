@@ -120,6 +120,9 @@ impl From<Event> for CEvent {
             } => {
                 let (ids, names): (Vec<_>, Vec<_>) = members
                     .into_iter()
+                    // `member_count` is a C int and `Drop` frees exactly that many: no more
+                    // members are handed over than it can count.
+                    .take(usize::try_from(c_int::MAX).unwrap_or_default())
                     .map(|m| (into_c(m.user_id), into_c(m.name)))
                     .unzip();
                 Self {
