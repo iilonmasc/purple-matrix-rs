@@ -1,0 +1,18 @@
+[package]
+name = "purple-matrix-rs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-or-later"
+description = "A libpurple protocol plugin for Matrix on the matrix-rust-sdk, end-to-end encryption included"
+repository = "https://github.com/iilonmasc/purple-matrix-rs"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+matrix-sdk = "0.19.1"
+tokio = { version = "1.53.2", features = ["rt-multi-thread"] }
+
+[profile.dev]
+debug = "line-tables-only"

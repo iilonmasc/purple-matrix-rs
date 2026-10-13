@@ -1,0 +1,34 @@
+# cargo-deny: licences, bans and sources run in `just check` (offline);
+# advisories run in `just audit`, which fetches the RustSec database.
+[graph]
+# Not all features: matrix-sdk's optional ones pull in crates that are never downloaded here, and
+# an offline check over them fails on the download. What is checked is what is built.
+all-features = false
+
+[licenses]
+allow = [
+    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib",
+    "Unicode-3.0", "MPL-2.0", "CDLA-Permissive-2.0",
+    # Boost: xxhash-rust, which matrix-sdk-base's growable-bloom-filter hashes with
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+# The fleet's own crates: this workspace's (publish = false) and the
+# orbitstack registry's.
+[licenses.private]
+ignore = true
+registries = ["orbitstack"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://forge.orbitstack.casa/api/packages/totlik/cargo/",
+]

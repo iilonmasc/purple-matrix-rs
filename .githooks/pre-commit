@@ -1,0 +1,5 @@
+#!/bin/sh
+# The fleet's pre-commit check of the staged content, where medic is installed;
+# a clone without it commits as git would.
+command -v medic >/dev/null 2>&1 || exit 0
+exec medic commit
