@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-14 — purple-matrix-rs 0.2.1
+
+- The plugin reports its version to libpurple from Cargo.toml instead of a literal that stayed at 0.1.0.
+
 ## 2026-10-14 — purple-matrix-rs 0.2.0
 
 - Every source file carries the GPL-2.0-or-later licence header, and the README says why a built plugin, which contains the Apache-2.0 SDK, is distributed under GPLv3.

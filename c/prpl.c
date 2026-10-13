@@ -74,6 +74,7 @@ typedef struct {
 } purple_matrix_event;
 
 extern char *purple_matrix_version(void);
+extern const char *purple_matrix_crate_version(void);
 extern purple_matrix_account *purple_matrix_account_new(void (*wake)(void *ctx), void *ctx);
 extern void purple_matrix_account_login(purple_matrix_account *account, const char *homeserver,
                                         const char *store_dir, const char *token);
@@ -453,7 +454,7 @@ static PurplePluginInfo info = {
 	PURPLE_PRIORITY_DEFAULT,
 	PRPL_ID,                                  /* id */
 	"Matrix",                                 /* name */
-	"0.1.0",                                  /* version */
+	NULL,                                     /* version: the crate's, set in matrix_plugin_init */
 	"Matrix protocol plugin",                 /* summary */
 	"Matrix on the matrix-rust-sdk, end-to-end encryption included",
 	"the purple-matrix-rs authors",           /* author */
@@ -470,6 +471,9 @@ static PurplePluginInfo info = {
 
 static void matrix_plugin_init(PurplePlugin *plugin)
 {
+	/* The version lives in Cargo.toml alone; the Rust side hands it over as a static string. */
+	info.version = (char *)purple_matrix_crate_version();
+
 	memset(&prpl_info, 0, sizeof(prpl_info));
 	prpl_info.struct_size = sizeof(prpl_info);
 	prpl_info.options = OPT_PROTO_PASSWORD_OPTIONAL | OPT_PROTO_UNIQUE_CHATNAME | OPT_PROTO_CHAT_TOPIC;
