@@ -321,6 +321,14 @@ pub extern "C" fn purple_matrix_version() -> *mut c_char {
     ))
 }
 
+/// The crate's version alone, as a static C string that lives as long as the plugin: the C side
+/// hands it to libpurple as the plugin's version, so the number is kept in one place, `Cargo.toml`.
+/// Never freed.
+#[unsafe(no_mangle)]
+pub extern "C" fn purple_matrix_crate_version() -> *const c_char {
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
+}
+
 /// Start an account's runtime thread. `wake` is called with `ctx` on that thread whenever events
 /// wait; it must schedule `purple_matrix_account_next_event` on the main thread and nothing more.
 /// Null when the thread could not be started.
@@ -509,6 +517,16 @@ mod tests {
         let out = unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned();
         unsafe { purple_matrix_string_free(s) };
         out
+    }
+
+    #[test]
+    fn the_crate_version_is_a_static_c_string_of_the_package_version() {
+        let v = unsafe { CStr::from_ptr(purple_matrix_crate_version()) }
+            .to_str()
+            .expect("utf-8");
+        assert_eq!(v, env!("CARGO_PKG_VERSION"));
+        // The same pointer every time: it is static, and the C side never frees it.
+        assert_eq!(purple_matrix_crate_version(), purple_matrix_crate_version());
     }
 
     #[test]
