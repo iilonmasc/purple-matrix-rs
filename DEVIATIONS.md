@@ -11,3 +11,7 @@
   commits as git would without `medic`; a public repository has to build and check for a stranger
   with Rust, just, clang, cargo-deny and cargo-machete alone. The lines are there, only spelled
   through a variable, which is why medic cannot see them. (iilonmasc, 2026-10-13)
+- **`deny.toml` allows the crate index alone** (`rust/deny-toml`) — the maintainer's private
+  registry is not a source of this crate's dependencies, and a public repository names no private
+  infrastructure; the licence list and the private-crate rule are as the template has them.
+  (iilonmasc, 2026-10-14)
