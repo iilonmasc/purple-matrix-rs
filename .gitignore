@@ -1,0 +1,5 @@
+/target/
+/plugin/
+/.dev/
+*.so
+*.o

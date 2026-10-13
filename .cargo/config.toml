@@ -1,0 +1,4 @@
+# The plugin is linked for macOS 13, Adium's floor; the Rust objects say the same so the
+# linker has nothing to warn about.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"
