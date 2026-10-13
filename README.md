@@ -11,8 +11,11 @@ today is the Rust SDK's.
 
 ## Status
 
-A skeleton. The protocol registers, the Rust side builds an SDK client with its SQLite stores, and
-that is where it stops. What it will do, in which order, is in [SPEC.md](SPEC.md).
+Signing in. The protocol registers, an account signs in with an access token in the password
+field (the option "The password is an access token" says so), the Rust side proves it with
+`whoami` on a runtime thread of its own and restores the SDK session with its SQLite stores — and
+that is where it stops: no rooms, no messages yet. What comes next, in which order, is in
+[SPEC.md](SPEC.md).
 
 ## Shape
 

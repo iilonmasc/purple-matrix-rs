@@ -12,7 +12,8 @@ crate-type = ["staticlib"]
 
 [dependencies]
 matrix-sdk = "0.19.1"
-tokio = { version = "1.53.2", features = ["rt-multi-thread"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "sync"] }
 
 [profile.dev]
 debug = "line-tables-only"
