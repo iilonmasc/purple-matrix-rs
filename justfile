@@ -87,7 +87,7 @@ plugin: build
 
 [doc("Delete the build output — run before every push")]
 clean:
-    cargo clean
+    rm -rf target
     rm -rf plugin
 
 [doc("Point git at the repo's hooks in .githooks/")]
